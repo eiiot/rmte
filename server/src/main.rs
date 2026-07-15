@@ -57,14 +57,33 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../../client/index.html"))
+const APP_JS: &str = include_str!("../../client/app.js");
+
+/// index.html with the app.js URL content-hashed, so edge caches (Cloudflare
+/// sits in front of tuft.host) can never serve a stale client.
+fn index_html() -> &'static str {
+    static INDEX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in APP_JS.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        include_str!("../../client/index.html").replace("__V__", &format!("{h:016x}"))
+    })
 }
 
-async fn app_js() -> ([(&'static str, &'static str); 1], &'static str) {
+async fn index() -> ([(&'static str, &'static str); 1], Html<&'static str>) {
+    ([("cache-control", "no-store")], Html(index_html()))
+}
+
+async fn app_js() -> ([(&'static str, &'static str); 2], &'static str) {
     (
-        [("content-type", "application/javascript")],
-        include_str!("../../client/app.js"),
+        [
+            ("content-type", "application/javascript"),
+            ("cache-control", "no-store"),
+        ],
+        APP_JS,
     )
 }
 
