@@ -33,12 +33,14 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    let tmux_args = vec![
-        "new-session".to_string(),
-        "-A".to_string(),
-        "-s".to_string(),
-        args.session.clone(),
-    ];
+    let tmux_args: Vec<String> = [
+        "new-session", "-A", "-s", &args.session,
+        // OSC 52 passthrough so tmux copy-mode / in-app copies reach the browser clipboard
+        ";", "set-option", "-s", "set-clipboard", "on",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let engine = Engine::spawn(tmux_args, 120, 32)?;
 
     let app = Router::new()

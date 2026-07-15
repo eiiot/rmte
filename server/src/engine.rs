@@ -19,6 +19,7 @@ use crate::palette;
 pub const MSG_FRAME: u8 = 1;
 pub const MSG_PONG: u8 = 2;
 pub const MSG_CLOSED: u8 = 4;
+pub const MSG_CLIPBOARD: u8 = 5;
 
 pub const ATTR_BOLD: u16 = 1;
 pub const ATTR_ITALIC: u16 = 2;
@@ -39,12 +40,27 @@ pub const MODE_MOUSE_DRAG: u32 = 64;
 #[derive(Clone)]
 pub struct EventProxy {
     pty_writes: std::sync::mpsc::Sender<Vec<u8>>,
+    frames: broadcast::Sender<Bytes>,
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event {
-            let _ = self.pty_writes.send(text.into_bytes());
+        match event {
+            Event::PtyWrite(text) => {
+                let _ = self.pty_writes.send(text.into_bytes());
+            }
+            // OSC 52 from apps/tmux: forward to the browser clipboard.
+            Event::ClipboardStore(_, text) => {
+                let mut msg = BytesMut::with_capacity(1 + text.len());
+                msg.put_u8(MSG_CLIPBOARD);
+                msg.put_slice(text.as_bytes());
+                let _ = self.frames.send(msg.freeze());
+            }
+            // OSC 52 read: we can't read the browser clipboard; reply empty.
+            Event::ClipboardLoad(_, format) => {
+                let _ = self.pty_writes.send(format("").into_bytes());
+            }
+            _ => {}
         }
     }
 }
@@ -80,8 +96,10 @@ impl Engine {
         let mut writer = pair.master.take_writer()?;
 
         let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (frames, _) = broadcast::channel(256);
         let proxy = EventProxy {
             pty_writes: input_tx.clone(),
+            frames: frames.clone(),
         };
 
         let config = TermConfig {
@@ -91,7 +109,6 @@ impl Engine {
         let size = alacritty_terminal::term::test::TermSize::new(cols as usize, rows as usize);
         let term = Term::new(config, &size, proxy);
 
-        let (frames, _) = broadcast::channel(256);
         let engine = Arc::new(Engine {
             term: Mutex::new(term),
             master: Mutex::new(pair.master),

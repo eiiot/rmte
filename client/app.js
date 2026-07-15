@@ -1,7 +1,7 @@
 'use strict';
 
 // ---- protocol constants (keep in sync with server/src/engine.rs) ----
-const MSG_FRAME = 1, MSG_PONG = 2, MSG_CLOSED = 4;
+const MSG_FRAME = 1, MSG_PONG = 2, MSG_CLOSED = 4, MSG_CLIPBOARD = 5;
 const IN_INPUT = 1, IN_RESIZE = 2, IN_PING = 3;
 const ATTR_BOLD = 1, ATTR_ITALIC = 2, ATTR_UNDERLINE = 4, ATTR_DIM = 8,
       ATTR_STRIKEOUT = 16, ATTR_WIDE = 32, ATTR_SPACER = 64;
@@ -41,8 +41,68 @@ const grid = {
     this.fg = new Uint32Array(n);
     this.bg = new Uint32Array(n);
     this.attr = new Uint16Array(n);
+    clearSelection();
   },
 };
+
+// ---- selection ----
+const SEL_BG = 0x2f5a8f;
+const sel = { active: false, dragging: false, startR: 0, startC: 0, endR: 0, endC: 0 };
+
+function normSel() {
+  let { startR: sr, startC: sc, endR: er, endC: ec } = sel;
+  if (sr > er || (sr === er && sc > ec)) [sr, sc, er, ec] = [er, ec, sr, sc];
+  return [sr, sc, er, ec];
+}
+
+function inSel(r, c) {
+  if (!sel.active) return false;
+  const [sr, sc, er, ec] = normSel();
+  if (r < sr || r > er) return false;
+  if (sr === er) return c >= sc && c <= ec;
+  if (r === sr) return c >= sc;
+  if (r === er) return c <= ec;
+  return true;
+}
+
+function markRows(a, b) {
+  const lo = Math.max(0, Math.min(a, b));
+  const hi = Math.min(grid.rows - 1, Math.max(a, b));
+  for (let r = lo; r <= hi; r++) dirtyRows.add(r);
+  schedulePaint();
+}
+
+function clearSelection() {
+  if (!sel.active) return;
+  const [sr, , er] = normSel();
+  sel.active = false;
+  sel.dragging = false;
+  markRows(sr, er);
+}
+
+function selectionText() {
+  if (!sel.active) return '';
+  const [sr, sc, er, ec] = normSel();
+  const lines = [];
+  for (let r = sr; r <= er; r++) {
+    const from = r === sr ? sc : 0;
+    const to = r === er ? ec : grid.cols - 1;
+    let line = '';
+    for (let c = from; c <= to && c < grid.cols; c++) {
+      const i = r * grid.cols + c;
+      if (grid.attr[i] & ATTR_SPACER) continue;
+      line += String.fromCodePoint(grid.cp[i] || 32);
+    }
+    lines.push(line.replace(/\s+$/, ''));
+  }
+  return lines.join('\n');
+}
+
+function copySelection() {
+  const text = selectionText();
+  if (!text.trim()) return;
+  navigator.clipboard.writeText(text).catch(() => {});
+}
 
 let haveFull = false;
 let dirtyRows = new Set();
@@ -82,10 +142,11 @@ function paintRow(r) {
   const y = r * cellH;
   const base = r * grid.cols;
 
-  // background runs
-  let runStart = 0, runBg = grid.bg[base];
+  // background runs (selection overrides cell bg)
+  const bgAt = (c) => (inSel(r, c) ? SEL_BG : grid.bg[base + c]);
+  let runStart = 0, runBg = bgAt(0);
   for (let c = 1; c <= grid.cols; c++) {
-    const bg = c < grid.cols ? grid.bg[base + c] : -1;
+    const bg = c < grid.cols ? bgAt(c) : -1;
     if (bg !== runBg) {
       ctx.fillStyle = color(runBg);
       ctx.fillRect(runStart * cellW, y, (c - runStart) * cellW + 0.5, cellH);
@@ -164,6 +225,11 @@ function applyFrame(buf) {
     const sent = v.getFloat64(1, true);
     rtt = performance.now() - sent;
     updateHud();
+    return;
+  }
+  if (type === MSG_CLIPBOARD) {
+    const text = new TextDecoder().decode(new Uint8Array(buf, 1));
+    if (text) navigator.clipboard.writeText(text).catch(() => {});
     return;
   }
   if (type === MSG_CLOSED) {
@@ -347,8 +413,36 @@ function encodeKey(e) {
   return e.key;
 }
 
+function sendPaste(text) {
+  if (!text) return;
+  if (grid.modes & MODE_BRACKETED_PASTE) {
+    sendInput('\x1b[200~' + text + '\x1b[201~');
+  } else {
+    sendInput(text);
+  }
+}
+
+function pasteFromClipboard() {
+  navigator.clipboard.readText().then(sendPaste).catch(() => {});
+}
+
 window.addEventListener('keydown', (e) => {
-  if (e.metaKey) return; // cmd combos stay with the browser
+  // copy/paste: cmd+c/cmd+v (mac), ctrl+shift+c/v (elsewhere)
+  const copyCombo = (e.metaKey && !e.ctrlKey && e.key === 'c') ||
+                    (e.ctrlKey && e.shiftKey && e.key === 'C');
+  const pasteCombo = (e.metaKey && !e.ctrlKey && e.key === 'v') ||
+                     (e.ctrlKey && e.shiftKey && e.key === 'V');
+  if (copyCombo && sel.active) {
+    e.preventDefault();
+    copySelection();
+    return;
+  }
+  if (pasteCombo) {
+    e.preventDefault();
+    pasteFromClipboard();
+    return;
+  }
+  if (e.metaKey) return; // other cmd combos stay with the browser
   const seq = encodeKey(e);
   if (seq !== null) {
     e.preventDefault();
@@ -360,11 +454,7 @@ window.addEventListener('paste', (e) => {
   const text = e.clipboardData.getData('text');
   if (!text) return;
   e.preventDefault();
-  if (grid.modes & MODE_BRACKETED_PASTE) {
-    sendInput('\x1b[200~' + text + '\x1b[201~');
-  } else {
-    sendInput(text);
-  }
+  sendPaste(text);
 });
 
 // ---- mouse ----
@@ -396,12 +486,33 @@ function sendMouse(btn, e, release) {
 let mouseButton = -1;
 canvas.addEventListener('mousedown', (e) => {
   window.focus();
+  // Local selection: plain drag when mouse reporting is off, shift+drag to override it.
+  if (e.button === 0 && (e.shiftKey || !(grid.modes & MODE_MOUSE))) {
+    e.preventDefault();
+    clearSelection();
+    const { x, y } = mouseCell(e);
+    sel.active = true;
+    sel.dragging = true;
+    sel.startR = sel.endR = y - 1;
+    sel.startC = sel.endC = x - 1;
+    return;
+  }
+  clearSelection();
   if (sendMouse(e.button, e, false)) {
     mouseButton = e.button;
     e.preventDefault();
   }
 });
 canvas.addEventListener('mouseup', (e) => {
+  if (sel.dragging) {
+    sel.dragging = false;
+    if (sel.startR === sel.endR && sel.startC === sel.endC) {
+      clearSelection();
+    } else {
+      copySelection(); // copy-on-select
+    }
+    return;
+  }
   if (sendMouse(e.button, e, true)) {
     mouseButton = -1;
     e.preventDefault();
@@ -409,6 +520,16 @@ canvas.addEventListener('mouseup', (e) => {
 });
 let lastMove = { x: -1, y: -1 };
 canvas.addEventListener('mousemove', (e) => {
+  if (sel.dragging) {
+    const { x, y } = mouseCell(e);
+    const r = y - 1, c = x - 1;
+    if (r === sel.endR && c === sel.endC) return;
+    const oldEnd = sel.endR;
+    sel.endR = r;
+    sel.endC = c;
+    markRows(Math.min(sel.startR, oldEnd, r), Math.max(sel.startR, oldEnd, r));
+    return;
+  }
   const wantDrag = mouseButton >= 0 && (grid.modes & (MODE_MOUSE_DRAG | MODE_MOUSE_MOTION));
   const wantMotion = grid.modes & MODE_MOUSE_MOTION;
   if (!wantDrag && !wantMotion) return;
@@ -417,6 +538,25 @@ canvas.addEventListener('mousemove', (e) => {
   lastMove = cell;
   const btn = mouseButton >= 0 ? mouseButton : 3;
   sendMouse(btn + 32, e, false);
+});
+canvas.addEventListener('dblclick', (e) => {
+  if ((grid.modes & MODE_MOUSE) && !e.shiftKey) return;
+  e.preventDefault();
+  const { x, y } = mouseCell(e);
+  const r = y - 1;
+  const at = (c) => String.fromCodePoint(grid.cp[r * grid.cols + c] || 32);
+  const isWord = (ch) => !/[\s|"'`()\[\]{}<>,;]/.test(ch);
+  let c1 = x - 1, c2 = x - 1;
+  if (!isWord(at(c1))) return;
+  while (c1 > 0 && isWord(at(c1 - 1))) c1--;
+  while (c2 < grid.cols - 1 && isWord(at(c2 + 1))) c2++;
+  sel.active = true;
+  sel.dragging = false;
+  sel.startR = sel.endR = r;
+  sel.startC = c1;
+  sel.endC = c2;
+  markRows(r, r);
+  copySelection();
 });
 canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
