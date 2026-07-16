@@ -17,7 +17,7 @@ function apply(buf) {
   o += 4; // seq
   const cols = v.getUint16(o, true); o += 2;
   const rows = v.getUint16(o, true); o += 2;
-  o += 2 + 2 + 1 + 4; // cursor, visible, modes
+  o += 2 + 2 + 1 + 4 + 4; // cursor, visible, modes, input-ack
   const lineCount = v.getUint16(o, true); o += 2;
   const full = !!(flags & 1);
   if (!haveFull && !full) return false;
@@ -50,11 +50,13 @@ function screenText() {
   return out;
 }
 
+let inputSeq = 0;
 function sendInput(str) {
   const payload = new TextEncoder().encode(str);
-  const msg = new Uint8Array(1 + payload.length);
+  const msg = new Uint8Array(5 + payload.length);
   msg[0] = 1;
-  msg.set(payload, 1);
+  new DataView(msg.buffer).setUint32(1, ++inputSeq, true);
+  msg.set(payload, 5);
   ws.send(msg);
 }
 

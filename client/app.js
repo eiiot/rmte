@@ -9,6 +9,9 @@ const MODE_APP_CURSOR = 1, MODE_BRACKETED_PASTE = 2, MODE_MOUSE = 4,
       MODE_SGR_MOUSE = 8, MODE_MOUSE_MOTION = 16, MODE_ALT_SCREEN = 32,
       MODE_MOUSE_DRAG = 64;
 
+const params = new URLSearchParams(location.search);
+const simLag = Math.max(0, +(params.get('lag') || 0)); // simulated extra RTT, ms
+
 const canvas = document.getElementById('term');
 const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 const hud = document.getElementById('hud');
@@ -42,8 +45,167 @@ const grid = {
     this.bg = new Uint32Array(n);
     this.attr = new Uint16Array(n);
     clearSelection();
+    flushPredictions();
   },
 };
+
+// ---- prediction engine (port of mosh's frontend/terminaloverlay.cc) ----
+// Epochs: a prediction is "tentative" (hidden) until some prediction from its
+// epoch is confirmed by the server; risky input (control chars) starts a new
+// epoch. Adaptive display: predictions only show when the link is slow enough
+// to need them. Flagging: underline predictions when the link is bad or a
+// prediction has been outstanding too long. Validation is ack-gated: a
+// prediction is judged only against frames whose input-ack covers it.
+const SRTT_TRIGGER_LOW = 20, SRTT_TRIGGER_HIGH = 30;   // show predictions
+const FLAG_TRIGGER_LOW = 50, FLAG_TRIGGER_HIGH = 80;   // underline them
+const GLITCH_THRESHOLD = 250, GLITCH_FLAG_THRESHOLD = 5000;
+const GLITCH_REPAIR_COUNT = 10, GLITCH_REPAIR_MININTERVAL = 150;
+const ACK_ECHO_GRACE = 150; // our ack = "reached the pty", echo may lag a beat
+
+const predict = {
+  mode: ['adaptive', 'always', 'never'].includes(params.get('predict')) ? params.get('predict') : 'adaptive',
+  cells: [],        // {row, col, cp, epoch, inputSeq, sentAt, ackedAt}
+  cursor: null,     // {row, col, epoch}
+  predictionEpoch: 1,
+  confirmedEpoch: 0,
+  srtt: null,
+  srttTrigger: false,
+  glitchTrigger: 0,
+  flagging: false,
+  lastQuickConfirmation: 0,
+};
+
+function predictActive() {
+  if (predict.mode === 'never') return false;
+  if (predict.mode === 'always') return true;
+  return predict.srttTrigger || predict.glitchTrigger > 0;
+}
+
+function predictSrttSample(ms) {
+  predict.srtt = predict.srtt == null ? ms : 0.875 * predict.srtt + 0.125 * ms;
+  if (predict.srtt > SRTT_TRIGGER_HIGH) predict.srttTrigger = true;
+  else if (predict.srttTrigger && predict.srtt <= SRTT_TRIGGER_LOW && !predict.cells.length) predict.srttTrigger = false;
+  if (predict.srtt > FLAG_TRIGGER_HIGH) predict.flagging = true;
+  else if (predict.flagging && predict.srtt <= FLAG_TRIGGER_LOW && !predict.glitchTrigger) predict.flagging = false;
+}
+
+function predictDirty() {
+  for (const p of predict.cells) dirtyRows.add(p.row);
+  if (predict.cursor) dirtyRows.add(predict.cursor.row);
+  dirtyRows.add(grid.curRow);
+  schedulePaint();
+}
+
+function becomeTentative() {
+  predict.predictionEpoch += 1;
+}
+
+function flushPredictions() {
+  if (!predict.cells.length && !predict.cursor) return;
+  predictDirty();
+  predict.cells = [];
+  predict.cursor = null;
+  becomeTentative();
+}
+
+function killEpoch(epoch) {
+  predictDirty();
+  predict.cells = predict.cells.filter((p) => p.epoch < epoch);
+  predict.cursor = null;
+  becomeTentative();
+  predict.glitchTrigger = GLITCH_REPAIR_COUNT * 2; // mispredicted: stay watchful
+}
+
+function predictInput(str, inputSeq) {
+  if (predict.mode === 'never' || !haveFull) return;
+  const now = performance.now();
+  for (const ch of str) {
+    const cp = ch.codePointAt(0);
+    if (cp === 0x7f) { // backspace: retract our own pending prediction only
+      if (predict.cells.length) {
+        const p = predict.cells.pop();
+        predict.cursor = { row: p.row, col: p.col, epoch: predict.predictionEpoch };
+        dirtyRows.add(p.row);
+        schedulePaint();
+      } else {
+        becomeTentative();
+      }
+      continue;
+    }
+    if (cp < 32 || (cp >= 0x1b && cp <= 0x1f)) { // control: risky, new epoch
+      becomeTentative();
+      if (predict.cursor) { dirtyRows.add(predict.cursor.row); schedulePaint(); }
+      predict.cursor = null;
+      continue;
+    }
+    const base = predict.cursor || { row: grid.curRow, col: grid.curCol };
+    if (!grid.curVisible || base.row >= grid.rows || base.col >= grid.cols - 1) {
+      becomeTentative();
+      continue; // no wrap prediction
+    }
+    predict.cells.push({
+      row: base.row, col: base.col, cp,
+      epoch: predict.predictionEpoch, inputSeq, sentAt: now, ackedAt: 0,
+    });
+    predict.cursor = { row: base.row, col: base.col + 1, epoch: predict.predictionEpoch };
+    dirtyRows.add(base.row);
+    schedulePaint();
+  }
+}
+
+function reconcilePredictions(ackSeq) {
+  if (!predict.cells.length && !predict.cursor) return;
+  const now = performance.now();
+  const surviving = [];
+  for (const p of predict.cells) {
+    if (ackSeq != null && !p.ackedAt && ackSeq >= p.inputSeq) p.ackedAt = now;
+    if (p.row < grid.rows && p.col < grid.cols && grid.cp[p.row * grid.cols + p.col] === p.cp) {
+      // confirmed correct
+      if (p.epoch > predict.confirmedEpoch) {
+        predict.confirmedEpoch = p.epoch;
+        predictDirty(); // newly-confirmed epoch may unhide siblings
+      }
+      if (now - p.sentAt < GLITCH_THRESHOLD &&
+          now - predict.lastQuickConfirmation >= GLITCH_REPAIR_MININTERVAL) {
+        if (predict.glitchTrigger > 0) predict.glitchTrigger -= 1;
+        predict.lastQuickConfirmation = now;
+      }
+      dirtyRows.add(p.row);
+      continue;
+    }
+    if (p.ackedAt && now - p.ackedAt > ACK_ECHO_GRACE) {
+      // frame provably includes this keystroke and the cell disagrees
+      killEpoch(p.epoch);
+      schedulePaint();
+      return;
+    }
+    if (now - p.sentAt > GLITCH_THRESHOLD) {
+      predict.glitchTrigger = Math.max(predict.glitchTrigger, GLITCH_REPAIR_COUNT * 2);
+      if (now - p.sentAt > GLITCH_FLAG_THRESHOLD) predict.flagging = true;
+    }
+    surviving.push(p);
+  }
+  predict.cells = surviving;
+  if (!predict.cells.length && predict.cursor) {
+    // everything confirmed: snap cursor back to server truth
+    dirtyRows.add(predict.cursor.row);
+    predict.cursor = null;
+    dirtyRows.add(grid.curRow);
+  }
+  schedulePaint();
+}
+
+// no-echo contexts (password prompts, vim normal mode) may never produce a
+// frame; expire outstanding predictions on a timer too
+setInterval(() => {
+  if (!predict.cells.length) return;
+  const now = performance.now();
+  const limit = Math.max(2 * (predict.srtt || 100), 500) + GLITCH_THRESHOLD;
+  if (now - predict.cells[0].sentAt > limit) {
+    killEpoch(predict.cells[0].epoch);
+    schedulePaint();
+  }
+}, 250);
 
 // ---- selection ----
 const SEL_BG = 0x2f5a8f;
@@ -180,10 +342,27 @@ function paintRow(r) {
     ctx.globalAlpha = 1;
   }
 
-  // cursor overlay
-  if (grid.curVisible && grid.curRow === r && grid.curCol < grid.cols) {
-    const i = base + grid.curCol;
-    const x = grid.curCol * cellW;
+  // prediction overlay (hidden while tentative; underlined when flagging)
+  if (predictActive()) {
+    for (const p of predict.cells) {
+      if (p.row !== r || p.epoch > predict.confirmedEpoch) continue;
+      const x = p.col * cellW;
+      ctx.fillStyle = color(grid.bg[base + p.col]);
+      ctx.fillRect(x, y, cellW, cellH);
+      ctx.font = `${FONT_SIZE}px ${FONT_STACK}`;
+      ctx.fillStyle = color(grid.fg[base + p.col] || 0xd4d4d4);
+      ctx.fillText(String.fromCodePoint(p.cp), x, y + baseline, cellW);
+      if (predict.flagging) ctx.fillRect(x, y + cellH - 2, cellW, 1);
+    }
+  }
+
+  // cursor overlay (at the predicted position when prediction is displayed)
+  const dc = (predictActive() && predict.cursor && predict.cursor.epoch <= predict.confirmedEpoch)
+    ? predict.cursor
+    : { row: grid.curRow, col: grid.curCol };
+  if (grid.curVisible && dc.row === r && dc.col < grid.cols) {
+    const i = base + dc.col;
+    const x = dc.col * cellW;
     if (focused) {
       ctx.fillStyle = color(grid.fg[i]);
       ctx.fillRect(x, y, cellW, cellH);
@@ -224,6 +403,7 @@ function applyFrame(buf) {
   if (type === MSG_PONG) {
     const sent = v.getFloat64(1, true);
     rtt = performance.now() - sent;
+    predictSrttSample(rtt);
     updateHud();
     return;
   }
@@ -247,6 +427,7 @@ function applyFrame(buf) {
   const curCol = v.getUint16(o, true); o += 2;
   const curVisible = !!v.getUint8(o); o += 1;
   const modes = v.getUint32(o, true); o += 4;
+  const ack = v.getUint32(o, true); o += 4;
   const lineCount = v.getUint16(o, true); o += 2;
 
   const full = !!(flags & 1);
@@ -271,6 +452,7 @@ function applyFrame(buf) {
   dirtyRows.add(prevCurRow);
   dirtyRows.add(curRow);
   if (full) { for (let r = 0; r < grid.rows; r++) dirtyRows.add(r); }
+  reconcilePredictions(ack);
   schedulePaint();
 }
 
@@ -310,7 +492,9 @@ function connect() {
     sendResize();
     updateHud();
   };
-  ws.onmessage = (ev) => applyFrame(ev.data);
+  ws.onmessage = simLag
+    ? (ev) => setTimeout(() => applyFrame(ev.data), simLag / 2)
+    : (ev) => applyFrame(ev.data);
   ws.onclose = () => {
     connected = false;
     hud.textContent = 'reconnecting…';
@@ -320,16 +504,22 @@ function connect() {
 }
 
 function send(bytes) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(bytes);
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (simLag) setTimeout(() => { if (ws.readyState === WebSocket.OPEN) ws.send(bytes); }, simLag / 2);
+  else ws.send(bytes);
 }
 
 const utf8 = new TextEncoder();
+let inputSeq = 0;
 function sendInput(str) {
+  inputSeq += 1;
   const payload = utf8.encode(str);
-  const msg = new Uint8Array(1 + payload.length);
+  const msg = new Uint8Array(5 + payload.length);
   msg[0] = IN_INPUT;
-  msg.set(payload, 1);
+  new DataView(msg.buffer).setUint32(1, inputSeq, true);
+  msg.set(payload, 5);
   send(msg);
+  return inputSeq;
 }
 
 function sendResize() {
@@ -352,7 +542,11 @@ function updateHud() {
   if (!connected) return;
   hud.classList.remove('bad');
   const ms = rtt == null ? '–' : rtt < 10 ? rtt.toFixed(1) : Math.round(rtt);
-  hud.textContent = `${ms}ms · ${grid.cols}×${grid.rows}`;
+  const parts = [`${ms}ms`, `${grid.cols}×${grid.rows}`];
+  if (simLag) parts.push(`+${simLag}ms lag`);
+  if (predict.mode !== 'adaptive') parts.push(`pred:${predict.mode}`);
+  else if (predictActive()) parts.push('pred:on');
+  hud.textContent = parts.join(' · ');
 }
 
 // ---- keyboard ----
@@ -446,7 +640,8 @@ window.addEventListener('keydown', (e) => {
   const seq = encodeKey(e);
   if (seq !== null) {
     e.preventDefault();
-    sendInput(seq);
+    const s = sendInput(seq);
+    predictInput(seq, s);
   }
 });
 

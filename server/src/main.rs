@@ -128,7 +128,11 @@ async fn client_loop(socket: WebSocket, engine: Arc<Engine>) {
                             continue;
                         }
                         match data[0] {
-                            IN_INPUT => engine.write_input(&data[1..]),
+                            // [1][u32 input seq][utf8 payload]
+                            IN_INPUT if data.len() >= 5 => {
+                                let seq = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+                                engine.write_input(seq, &data[5..]);
+                            }
                             IN_RESIZE if data.len() >= 5 => {
                                 let cols = u16::from_le_bytes([data[1], data[2]]);
                                 let rows = u16::from_le_bytes([data[3], data[4]]);

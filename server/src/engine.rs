@@ -73,6 +73,12 @@ pub struct Engine {
     dirty: Notify,
     full_needed: AtomicBool,
     seq: AtomicU32,
+    // Highest client input seq handed to the PTY; frames ack it so the client
+    // prediction engine only judges a prediction against a frame that provably
+    // includes its keystroke. (Shared across clients: with one typer it's
+    // exact; concurrent typers at worst cause an early epoch kill, never a
+    // wrong display.)
+    last_input: AtomicU32,
     last_cursor: Mutex<(u16, u16)>,
 }
 
@@ -117,6 +123,7 @@ impl Engine {
             dirty: Notify::new(),
             full_needed: AtomicBool::new(false),
             seq: AtomicU32::new(0),
+            last_input: AtomicU32::new(0),
             last_cursor: Mutex::new((0, 0)),
         });
 
@@ -174,7 +181,8 @@ impl Engine {
         self.dirty.notify_one();
     }
 
-    pub fn write_input(&self, data: &[u8]) {
+    pub fn write_input(&self, seq: u32, data: &[u8]) {
+        self.last_input.store(seq, Ordering::Relaxed);
         let _ = self.input_tx.send(data.to_vec());
     }
 
@@ -313,6 +321,7 @@ impl Engine {
         buf.put_u16_le(cur_col);
         buf.put_u8(cursor_visible as u8);
         buf.put_u32_le(modes);
+        buf.put_u32_le(self.last_input.load(Ordering::Relaxed));
         buf.put_u16_le(damage.len() as u16);
 
         for (&row, &(left, right)) in &damage {

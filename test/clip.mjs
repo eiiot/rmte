@@ -16,9 +16,10 @@ ws.onmessage = (ev) => {
     sent = true;
     const cmd = `printf '\\033]52;c;${b64}\\007'\r`;
     const payload = new TextEncoder().encode(cmd);
-    const msg = new Uint8Array(1 + payload.length);
+    const msg = new Uint8Array(5 + payload.length);
     msg[0] = 1;
-    msg.set(payload, 1);
+    new DataView(msg.buffer).setUint32(1, 1, true);
+    msg.set(payload, 5);
     ws.send(msg);
   }
   if (bytes[0] === 5) {
