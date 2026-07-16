@@ -168,6 +168,17 @@ function displayedCursor() {
   return { row: grid.curRow, col: grid.curCol, tentative: false };
 }
 
+// what the user actually sees at (r,c): the prediction overlay composited
+// over server truth — selection/copy must read this, not just the grid
+function displayedCp(r, c) {
+  if (predictActive()) {
+    const orow = predict.overlays.get(r);
+    const p = orow && orow[c];
+    if (p && p.active && !p.unknown && p.tue <= predict.confirmedEpoch + 1) return p.cp;
+  }
+  return grid.cp[r * grid.cols + c];
+}
+
 function pushCursorPrediction(row, col, seq) {
   predict.cursors.push({
     row, col, tue: predict.predictionEpoch,
@@ -366,7 +377,7 @@ function predictInput(str, seq) {
 // frame usually IS the echo frame), but declaring a prediction *wrong* waits
 // ACK_ECHO_GRACE past the ack, because our ack means "reached the pty" and
 // the echo can trail it by a beat.
-function cellValidity(cell, rowNum, ackSeq, now) {
+function cellValidity(cell, rowNum, ackSeq, now, grace) {
   if (!cell.active) return 'inactive';
   if (rowNum >= grid.rows || cell.col >= grid.cols) return 'incorrect';
   if (ackSeq != null && !cell.ackedAt && ackSeq >= cell.expirationSeq) cell.ackedAt = now;
@@ -376,18 +387,22 @@ function cellValidity(cell, rowNum, ackSeq, now) {
   if (gridCp(rowNum, cell.col) === cell.cp) {
     return cell.origCps.includes(cell.cp) ? 'correct-nocredit' : 'correct';
   }
-  if (now - cell.ackedAt < ACK_ECHO_GRACE) return 'pending';
+  if (now - cell.ackedAt < grace) return 'pending';
   return 'incorrect';
 }
 
-function reconcilePredictions(ackSeq) {
+function reconcilePredictions(ackSeq, fullRedraw) {
   const now = performance.now();
   updateTriggers();
+  // A full server redraw (clear, alt-screen switch, resync) is a complete
+  // statement of the screen: anything it acks but contradicts is judged with
+  // zero grace, so ghosts vanish with the redraw instead of lingering.
+  const grace = fullRedraw ? 0 : ACK_ECHO_GRACE;
 
   for (const [rowNum, row] of predict.overlays) {
     if (rowNum >= grid.rows) { predict.overlays.delete(rowNum); continue; }
     for (const cell of row) {
-      switch (cellValidity(cell, rowNum, ackSeq, now)) {
+      switch (cellValidity(cell, rowNum, ackSeq, now, grace)) {
         case 'incorrect':
           if (cell.tue > predict.confirmedEpoch) {
             killEpoch(cell.tue); // cull only the tentative epoch
@@ -440,7 +455,7 @@ function reconcilePredictions(ackSeq) {
     if (cur.ackedAt && cur.row === grid.curRow && cur.col === grid.curCol) {
       dirtyRows.add(cur.row);
       predict.cursors = []; // settled and correct: server truth takes over
-    } else if (cur.ackedAt && now - cur.ackedAt >= ACK_ECHO_GRACE) {
+    } else if (cur.ackedAt && now - cur.ackedAt >= grace) {
       predictReset();
       return;
     } else {
@@ -519,7 +534,7 @@ function selectionText() {
     for (let c = from; c <= to && c < grid.cols; c++) {
       const i = r * grid.cols + c;
       if (grid.attr[i] & ATTR_SPACER) continue;
-      line += String.fromCodePoint(grid.cp[i] || 32);
+      line += String.fromCodePoint(displayedCp(r, c) || 32);
     }
     lines.push(line.replace(/\s+$/, ''));
   }
@@ -729,7 +744,10 @@ function applyFrame(buf) {
   dirtyRows.add(prevCurRow);
   dirtyRows.add(curRow);
   if (full) { for (let r = 0; r < grid.rows; r++) dirtyRows.add(r); }
-  reconcilePredictions(ack);
+  // a clear/alt-screen switch may arrive as all-rows partial damage rather
+  // than a flagged full frame — treat a near-total redraw the same way
+  const redraw = full || lineCount >= Math.max(4, Math.floor(grid.rows * 0.8));
+  reconcilePredictions(ack, redraw);
   schedulePaint();
 }
 
@@ -1019,7 +1037,7 @@ canvas.addEventListener('dblclick', (e) => {
   e.preventDefault();
   const { x, y } = mouseCell(e);
   const r = y - 1;
-  const at = (c) => String.fromCodePoint(grid.cp[r * grid.cols + c] || 32);
+  const at = (c) => String.fromCodePoint(displayedCp(r, c) || 32);
   const isWord = (ch) => !/[\s|"'`()\[\]{}<>,;]/.test(ch);
   let c1 = x - 1, c2 = x - 1;
   if (!isWord(at(c1))) return;
