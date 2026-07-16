@@ -133,12 +133,24 @@ function predictInput(str, inputSeq) {
   const now = performance.now();
   for (const ch of str) {
     const cp = ch.codePointAt(0);
-    if (cp === 0x7f) { // backspace: retract our own pending prediction only
+    if (cp === 0x7f) { // backspace
       if (predict.cells.length) {
+        // retract our own pending prediction
         const p = predict.cells.pop();
         setCursorPrediction(p.row, p.col, inputSeq, now);
       } else {
-        becomeTentative();
+        // predict the erase itself (as mosh does): blank the previous cell
+        // and step the cursor left; validated like any other prediction
+        const base = predict.cursor || { row: grid.curRow, col: grid.curCol };
+        if (grid.curVisible && base.col > 0 && base.row < grid.rows) {
+          predict.cells.push({
+            row: base.row, col: base.col - 1, cp: 32,
+            epoch: predict.predictionEpoch, inputSeq, sentAt: now, ackedAt: 0,
+          });
+          setCursorPrediction(base.row, base.col - 1, inputSeq, now);
+        } else {
+          becomeTentative();
+        }
       }
       continue;
     }
@@ -373,17 +385,23 @@ function paintRow(r) {
     ctx.globalAlpha = 1;
   }
 
-  // prediction overlay (hidden while tentative; underlined when flagging)
+  // prediction overlay: shown immediately, underlined until confirmed.
+  // Deviation from stock mosh (which hides a whole epoch until it confirms):
+  // we display one epoch past the confirmed one so typing right after Enter
+  // is instant; hiding only kicks in beyond an unconfirmed risky boundary
+  // (e.g. right after a misprediction was culled).
   if (predictActive()) {
     for (const p of predict.cells) {
-      if (p.row !== r || p.epoch > predict.confirmedEpoch) continue;
+      if (p.row !== r || p.epoch > predict.confirmedEpoch + 1) continue;
       const x = p.col * cellW;
       ctx.fillStyle = color(grid.bg[base + p.col]);
       ctx.fillRect(x, y, cellW, cellH);
       ctx.font = `${FONT_SIZE}px ${FONT_STACK}`;
       ctx.fillStyle = color(grid.fg[base + p.col] || 0xd4d4d4);
-      ctx.fillText(String.fromCodePoint(p.cp), x, y + baseline, cellW);
-      if (predict.flagging) ctx.fillRect(x, y + cellH - 2, cellW, 1);
+      if (p.cp !== 32) ctx.fillText(String.fromCodePoint(p.cp), x, y + baseline, cellW);
+      if (predict.flagging || p.epoch > predict.confirmedEpoch) {
+        ctx.fillRect(x, y + cellH - 2, cellW, 1);
+      }
     }
   }
 
