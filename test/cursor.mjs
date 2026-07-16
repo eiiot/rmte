@@ -19,8 +19,7 @@ await page.waitForTimeout(1200);
 await page.evaluate(() => {
   window.__samples = [];
   window.__timer = setInterval(() => {
-    const predCursor = predictActive() && predict.cursor;
-    const dc = predCursor ? predict.cursor : { row: grid.curRow, col: grid.curCol };
+    const dc = displayedCursor();
     window.__samples.push({ r: dc.row, c: dc.col, t: performance.now() });
   }, 20);
 });

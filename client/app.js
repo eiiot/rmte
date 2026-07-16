@@ -45,29 +45,33 @@ const grid = {
     this.bg = new Uint32Array(n);
     this.attr = new Uint16Array(n);
     clearSelection();
-    flushPredictions();
+    predictReset(); // mosh resets all predictions on resize
   },
 };
 
-// ---- prediction engine (port of mosh's frontend/terminaloverlay.cc) ----
-// Epochs: a prediction is "tentative" (hidden) until some prediction from its
-// epoch is confirmed by the server; risky input (control chars) starts a new
-// epoch. Adaptive display: predictions only show when the link is slow enough
-// to need them. Flagging: underline predictions when the link is bad or a
-// prediction has been outstanding too long. Validation is ack-gated: a
-// prediction is judged only against frames whose input-ack covers it.
-const SRTT_TRIGGER_LOW = 20, SRTT_TRIGGER_HIGH = 30;   // show predictions
-const FLAG_TRIGGER_LOW = 50, FLAG_TRIGGER_HIGH = 80;   // underline them
+// ---- prediction engine: port of mosh's frontend/terminaloverlay.cc ----
+// Row overlays: each predicted row is a full array of conditional cells.
+// Typing inserts (shifting the rest of the row right); backspace shifts the
+// rest of the row left; boundary cells whose contents we can't know are
+// marked `unknown` and never validate or kill (mosh's model — this is what
+// makes delete instant and prevents stale echoes from ghosting back).
+// Validation is ack-gated (mosh's late_ack): a cell is judged only against
+// frames whose input-ack covers the keystroke that made it, plus a small
+// grace because our ack means "reached the pty", not "echoed".
+//
+// Deliberate display deviation from stock mosh (user preference): cells
+// render one epoch past the confirmed epoch, underlined until confirmed,
+// instead of hiding a fresh epoch for a full round-trip.
+const SRTT_TRIGGER_LOW = 20, SRTT_TRIGGER_HIGH = 30;   // gate on send_interval ≈ srtt/2
+const FLAG_TRIGGER_LOW = 50, FLAG_TRIGGER_HIGH = 80;
 const GLITCH_THRESHOLD = 250, GLITCH_FLAG_THRESHOLD = 5000;
 const GLITCH_REPAIR_COUNT = 10, GLITCH_REPAIR_MININTERVAL = 150;
-const ACK_ECHO_GRACE = 150; // our ack = "reached the pty", echo may lag a beat
-
-const CURSOR_ADOPT_GRACE = 50; // ms after ack before trusting the server cursor again
+const ACK_ECHO_GRACE = 150;
 
 const predict = {
   mode: ['adaptive', 'always', 'never'].includes(params.get('predict')) ? params.get('predict') : 'adaptive',
-  cells: [],        // {row, col, cp, epoch, inputSeq, sentAt, ackedAt}
-  cursor: null,     // {row, col, epoch, inputSeq, sentAt, ackedAt}
+  overlays: new Map(),   // rowNum -> array[cols] of conditional overlay cells
+  cursors: [],           // {row, col, tue, expirationSeq, ackedAt, predictionTime}
   predictionEpoch: 1,
   confirmedEpoch: 0,
   srtt: null,
@@ -85,168 +89,387 @@ function predictActive() {
 
 function predictSrttSample(ms) {
   predict.srtt = predict.srtt == null ? ms : 0.875 * predict.srtt + 0.125 * ms;
-  if (predict.srtt > SRTT_TRIGGER_HIGH) predict.srttTrigger = true;
-  else if (predict.srttTrigger && predict.srtt <= SRTT_TRIGGER_LOW && !predict.cells.length) predict.srttTrigger = false;
-  if (predict.srtt > FLAG_TRIGGER_HIGH) predict.flagging = true;
-  else if (predict.flagging && predict.srtt <= FLAG_TRIGGER_LOW && !predict.glitchTrigger) predict.flagging = false;
+  updateTriggers();
 }
 
-function predictDirty() {
-  for (const p of predict.cells) dirtyRows.add(p.row);
-  if (predict.cursor) dirtyRows.add(predict.cursor.row);
-  dirtyRows.add(grid.curRow);
-  schedulePaint();
+// trigger hysteresis; mosh gates on send_interval ≈ srtt/2
+function updateTriggers() {
+  const sendInterval = predict.srtt == null ? 0 : predict.srtt / 2;
+  if (sendInterval > SRTT_TRIGGER_HIGH) predict.srttTrigger = true;
+  else if (predict.srttTrigger && sendInterval <= SRTT_TRIGGER_LOW && !anyPending()) predict.srttTrigger = false;
+  if (sendInterval > FLAG_TRIGGER_HIGH) predict.flagging = true;
+  else if (sendInterval <= FLAG_TRIGGER_LOW) predict.flagging = false;
+  if (predict.glitchTrigger > GLITCH_REPAIR_COUNT) predict.flagging = true;
+}
+
+function predictPendingCount() {
+  let n = 0;
+  for (const row of predict.overlays.values()) {
+    for (const c of row) if (c.active) n += 1;
+  }
+  return n;
+}
+
+function anyPending() {
+  return predictPendingCount() > 0 || predict.cursors.length > 0;
+}
+
+function freshCell(col) {
+  return {
+    col, active: false, unknown: false, cp: 32, fg: 0xd4d4d4, bg: 0x121212,
+    tue: 0, expirationSeq: 0, ackedAt: 0, predictionTime: 0, origCps: [],
+  };
+}
+
+function getOrMakeRow(rowNum) {
+  let row = predict.overlays.get(rowNum);
+  if (!row || row.length !== grid.cols) {
+    row = Array.from({ length: grid.cols }, (_, i) => freshCell(i));
+    predict.overlays.set(rowNum, row);
+  }
+  return row;
 }
 
 function becomeTentative() {
   predict.predictionEpoch += 1;
 }
 
-function flushPredictions() {
-  if (!predict.cells.length && !predict.cursor) return;
-  predictDirty();
-  predict.cells = [];
-  predict.cursor = null;
-  becomeTentative();
+function predictDirty() {
+  for (const rowNum of predict.overlays.keys()) dirtyRows.add(rowNum);
+  for (const cur of predict.cursors) dirtyRows.add(cur.row);
+  dirtyRows.add(grid.curRow);
+  schedulePaint();
 }
 
-function killEpoch(epoch) {
+function predictReset() {
+  const hadState = anyPending();
   predictDirty();
-  predict.cells = predict.cells.filter((p) => p.epoch < epoch);
-  predict.cursor = null;
-  becomeTentative();
-  predict.glitchTrigger = GLITCH_REPAIR_COUNT * 2; // mispredicted: stay watchful
+  predict.overlays.clear();
+  predict.cursors = [];
+  // only start a new epoch if there was state to invalidate; a no-op reset
+  // (e.g. the initial resize) must not push fresh predictions out of the
+  // display grace window
+  if (hadState) becomeTentative();
 }
 
-function setCursorPrediction(row, col, inputSeq, now) {
-  if (predict.cursor) dirtyRows.add(predict.cursor.row);
-  predict.cursor = {
-    row, col, epoch: predict.predictionEpoch,
-    inputSeq, sentAt: now, ackedAt: 0,
-  };
+function resetCell(cell) {
+  cell.active = false;
+  cell.unknown = false;
+  cell.origCps = [];
+}
+
+function lastCursor() {
+  return predict.cursors.length ? predict.cursors[predict.cursors.length - 1] : null;
+}
+
+function displayedCursor() {
+  const pcur = predictActive() ? lastCursor() : null;
+  if (pcur) return { row: pcur.row, col: pcur.col, tentative: pcur.tue > predict.confirmedEpoch };
+  return { row: grid.curRow, col: grid.curCol, tentative: false };
+}
+
+function pushCursorPrediction(row, col, seq) {
+  predict.cursors.push({
+    row, col, tue: predict.predictionEpoch,
+    expirationSeq: seq, ackedAt: 0, predictionTime: performance.now(),
+  });
   dirtyRows.add(row);
   schedulePaint();
 }
 
-function predictInput(str, inputSeq) {
-  if (predict.mode === 'never' || !haveFull) return;
-  const now = performance.now();
-  for (const ch of str) {
-    const cp = ch.codePointAt(0);
-    if (cp === 0x7f) { // backspace
-      if (predict.cells.length) {
-        // retract our own pending prediction
-        const p = predict.cells.pop();
-        setCursorPrediction(p.row, p.col, inputSeq, now);
-      } else {
-        // predict the erase itself (as mosh does): blank the previous cell
-        // and step the cursor left; validated like any other prediction
-        const base = predict.cursor || { row: grid.curRow, col: grid.curCol };
-        if (grid.curVisible && base.col > 0 && base.row < grid.rows) {
-          predict.cells.push({
-            row: base.row, col: base.col - 1, cp: 32,
-            epoch: predict.predictionEpoch, inputSeq, sentAt: now, ackedAt: 0,
-          });
-          setCursorPrediction(base.row, base.col - 1, inputSeq, now);
-        } else {
-          becomeTentative();
-        }
-      }
-      continue;
-    }
-    if (cp === 0x0d) { // Enter: predict cursor to column 0 of the next row (as mosh does)
-      becomeTentative();
-      const base = predict.cursor || { row: grid.curRow, col: grid.curCol };
-      setCursorPrediction(Math.min(base.row + 1, grid.rows - 1), 0, inputSeq, now);
-      continue;
-    }
-    if (cp < 32) { // other control: risky — new epoch, keep whatever cursor we have current
-      becomeTentative();
-      continue;
-    }
-    const base = predict.cursor || { row: grid.curRow, col: grid.curCol };
-    if (!grid.curVisible || base.row >= grid.rows || base.col >= grid.cols - 1) {
-      becomeTentative();
-      continue; // no wrap prediction
-    }
-    predict.cells.push({
-      row: base.row, col: base.col, cp,
-      epoch: predict.predictionEpoch, inputSeq, sentAt: now, ackedAt: 0,
-    });
-    setCursorPrediction(base.row, base.col + 1, inputSeq, now);
+function initCursor(seq) {
+  const cur = lastCursor();
+  if (!cur) {
+    pushCursorPrediction(grid.curRow, grid.curCol, seq);
+  } else if (cur.tue !== predict.predictionEpoch) {
+    pushCursorPrediction(cur.row, cur.col, seq);
   }
 }
 
-function reconcilePredictions(ackSeq) {
-  if (!predict.cells.length && !predict.cursor) return;
-  const now = performance.now();
-  const surviving = [];
-  let killAt = -1;
-  let i = 0;
-  for (; i < predict.cells.length; i++) {
-    const p = predict.cells[i];
-    if (ackSeq != null && !p.ackedAt && ackSeq >= p.inputSeq) p.ackedAt = now;
-    if (p.row < grid.rows && p.col < grid.cols && grid.cp[p.row * grid.cols + p.col] === p.cp) {
-      // confirmed correct
-      if (p.epoch > predict.confirmedEpoch) {
-        predict.confirmedEpoch = p.epoch;
-        predictDirty(); // newly-confirmed epoch may unhide siblings
-      }
-      if (now - p.sentAt < GLITCH_THRESHOLD &&
-          now - predict.lastQuickConfirmation >= GLITCH_REPAIR_MININTERVAL) {
-        if (predict.glitchTrigger > 0) predict.glitchTrigger -= 1;
-        predict.lastQuickConfirmation = now;
-      }
-      dirtyRows.add(p.row);
-      continue;
+function killEpoch(epoch) {
+  predictDirty();
+  predict.cursors = predict.cursors.filter((c) => c.tue < epoch);
+  pushCursorPrediction(grid.curRow, grid.curCol, inputSeq); // snap to server truth
+  for (const row of predict.overlays.values()) {
+    for (const cell of row) {
+      if (cell.active && cell.tue >= epoch) resetCell(cell);
     }
-    if (p.ackedAt && now - p.ackedAt > ACK_ECHO_GRACE) {
-      // frame provably includes this keystroke and the cell disagrees
-      killAt = p.epoch;
-      i++;
-      break;
-    }
-    if (now - p.sentAt > GLITCH_THRESHOLD) {
-      predict.glitchTrigger = Math.max(predict.glitchTrigger, GLITCH_REPAIR_COUNT * 2);
-      if (now - p.sentAt > GLITCH_FLAG_THRESHOLD) predict.flagging = true;
-    }
-    surviving.push(p);
   }
-  for (; i < predict.cells.length; i++) surviving.push(predict.cells[i]);
-  predict.cells = surviving;
-  if (killAt >= 0) {
-    killEpoch(killAt);
-    schedulePaint();
+  becomeTentative();
+}
+
+function gridCp(r, c) { return grid.cp[r * grid.cols + c]; }
+function gridFg(r, c) { return grid.fg[r * grid.cols + c]; }
+function gridBg(r, c) { return grid.bg[r * grid.cols + c]; }
+
+// rough single-width check (mosh predicts only wcwidth == 1 characters)
+function isNarrow(cp) {
+  if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return false;
+  if (cp >= 0x1100 && (
+    cp <= 0x115f || cp === 0x2329 || cp === 0x232a ||
+    (cp >= 0x2e80 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) ||
+    cp >= 0x1f300)) return false;
+  return true;
+}
+
+function stampCell(cell, seq, now) {
+  if (!cell.active) cell.origCps = [];
+  cell.active = true;
+  cell.tue = predict.predictionEpoch;
+  cell.expirationSeq = seq;
+  cell.ackedAt = 0;
+  cell.predictionTime = now;
+}
+
+function newlineCarriageReturn(seq) {
+  initCursor(seq);
+  const cur = lastCursor();
+  dirtyRows.add(cur.row);
+  cur.col = 0;
+  cur.expirationSeq = seq;
+  cur.ackedAt = 0;
+  // mosh doesn't predict the scroll on the last row; neither do we
+  if (cur.row < grid.rows - 1) cur.row += 1;
+  dirtyRows.add(cur.row);
+  schedulePaint();
+}
+
+function predictInput(str, seq) {
+  if (predict.mode === 'never' || !haveFull) return;
+  const now = performance.now();
+
+  // left/right arrows are predicted cursor moves (mosh: CSI C / CSI D)
+  if (str === '\x1b[C' || str === '\x1bOC' || str === '\x1b[D' || str === '\x1bOD') {
+    initCursor(seq);
+    const cur = lastCursor();
+    const dc = str.endsWith('C') ? 1 : -1;
+    if ((dc > 0 && cur.col < grid.cols - 1) || (dc < 0 && cur.col > 0)) {
+      dirtyRows.add(cur.row);
+      cur.col += dc;
+      cur.expirationSeq = seq;
+      cur.ackedAt = 0;
+      schedulePaint();
+    }
     return;
   }
-  // Cursor handoff: adopt the server cursor only once a frame provably
-  // reflects the keystroke that placed the predicted cursor (plus a small
-  // echo grace) — never snap back to a stale position.
-  if (predict.cursor) {
-    const cur = predict.cursor;
-    if (ackSeq != null && !cur.ackedAt && ackSeq >= cur.inputSeq) cur.ackedAt = now;
-    if (cur.ackedAt && now - cur.ackedAt > CURSOR_ADOPT_GRACE && !predict.cells.length) {
+  if (str.length > 1 && str.charCodeAt(0) === 0x1b) { // other escape sequence
+    becomeTentative();
+    return;
+  }
+
+  for (const ch of str) {
+    const cp = ch.codePointAt(0);
+
+    if (cp === 0x7f) { // backspace: shift the rest of the row left (mosh model)
+      initCursor(seq);
+      const cur = lastCursor();
+      if (cur.row >= grid.rows) { becomeTentative(); continue; }
+      const row = getOrMakeRow(cur.row);
+      if (cur.col > 0) {
+        cur.col -= 1;
+        cur.expirationSeq = seq;
+        cur.ackedAt = 0;
+        for (let i = cur.col; i < grid.cols; i++) {
+          const cell = row[i];
+          stampCell(cell, seq, now);
+          cell.origCps.push(gridCp(cur.row, i));
+          if (i + 2 < grid.cols) {
+            const next = row[i + 1];
+            if (next.active) {
+              cell.unknown = next.unknown;
+              if (!next.unknown) { cell.cp = next.cp; cell.fg = next.fg; cell.bg = next.bg; }
+            } else {
+              cell.unknown = false;
+              cell.cp = gridCp(cur.row, i + 1);
+              cell.fg = gridFg(cur.row, i + 1);
+              cell.bg = gridBg(cur.row, i + 1);
+            }
+          } else {
+            cell.unknown = true;
+          }
+        }
+        dirtyRows.add(cur.row);
+        schedulePaint();
+      }
+      continue;
+    }
+
+    if (cp === 0x0d) { // CR
+      becomeTentative();
+      newlineCarriageReturn(seq);
+      continue;
+    }
+
+    if (!isNarrow(cp)) { // control chars and wide chars: unknown effect
+      becomeTentative();
+      continue;
+    }
+
+    // printable single-width char: insert with shift-right (mosh model)
+    initCursor(seq);
+    const cur = lastCursor();
+    if (cur.row >= grid.rows || cur.col >= grid.cols) { becomeTentative(); continue; }
+    const row = getOrMakeRow(cur.row);
+    if (cur.col + 1 >= grid.cols) becomeTentative(); // last column is tricky
+
+    for (let i = grid.cols - 1; i > cur.col; i--) {
+      const cell = row[i];
+      stampCell(cell, seq, now);
+      cell.origCps.push(gridCp(cur.row, i));
+      if (i === grid.cols - 1) {
+        cell.unknown = true;
+      } else {
+        const prev = row[i - 1];
+        if (prev.active) {
+          cell.unknown = prev.unknown;
+          if (!prev.unknown) { cell.cp = prev.cp; cell.fg = prev.fg; cell.bg = prev.bg; }
+        } else {
+          cell.unknown = false;
+          cell.cp = gridCp(cur.row, i - 1);
+          cell.fg = gridFg(cur.row, i - 1);
+          cell.bg = gridBg(cur.row, i - 1);
+        }
+      }
+    }
+
+    const cell = row[cur.col];
+    stampCell(cell, seq, now);
+    cell.unknown = false;
+    cell.origCps.push(gridCp(cur.row, cur.col));
+    cell.cp = cp;
+    // heuristic (mosh): match renditions of the character to the left
+    if (cur.col > 0) {
+      const prev = row[cur.col - 1];
+      if (prev.active && !prev.unknown) { cell.fg = prev.fg; cell.bg = prev.bg; }
+      else { cell.fg = gridFg(cur.row, cur.col - 1); cell.bg = gridBg(cur.row, cur.col - 1); }
+    } else {
+      cell.fg = gridFg(cur.row, cur.col); cell.bg = gridBg(cur.row, cur.col);
+    }
+    dirtyRows.add(cur.row);
+
+    cur.expirationSeq = seq;
+    cur.ackedAt = 0;
+    if (cur.col < grid.cols - 1) {
+      cur.col += 1;
+    } else {
+      becomeTentative();
+      newlineCarriageReturn(seq);
+    }
+    schedulePaint();
+  }
+}
+
+// mosh Validity: pending / correct / correct-nocredit / incorrect.
+// Asymmetric grace: a match confirms as soon as the ack covers it (the ack
+// frame usually IS the echo frame), but declaring a prediction *wrong* waits
+// ACK_ECHO_GRACE past the ack, because our ack means "reached the pty" and
+// the echo can trail it by a beat.
+function cellValidity(cell, rowNum, ackSeq, now) {
+  if (!cell.active) return 'inactive';
+  if (rowNum >= grid.rows || cell.col >= grid.cols) return 'incorrect';
+  if (ackSeq != null && !cell.ackedAt && ackSeq >= cell.expirationSeq) cell.ackedAt = now;
+  if (!cell.ackedAt) return 'pending';
+  if (cell.unknown) return 'correct-nocredit';
+  if (cell.cp === 32) return 'correct-nocredit'; // blank: "too easy for this to trigger falsely"
+  if (gridCp(rowNum, cell.col) === cell.cp) {
+    return cell.origCps.includes(cell.cp) ? 'correct-nocredit' : 'correct';
+  }
+  if (now - cell.ackedAt < ACK_ECHO_GRACE) return 'pending';
+  return 'incorrect';
+}
+
+function reconcilePredictions(ackSeq) {
+  const now = performance.now();
+  updateTriggers();
+
+  for (const [rowNum, row] of predict.overlays) {
+    if (rowNum >= grid.rows) { predict.overlays.delete(rowNum); continue; }
+    for (const cell of row) {
+      switch (cellValidity(cell, rowNum, ackSeq, now)) {
+        case 'incorrect':
+          if (cell.tue > predict.confirmedEpoch) {
+            killEpoch(cell.tue); // cull only the tentative epoch
+          } else {
+            predictReset(); // a confirmed-epoch prediction was wrong: start over
+            return;
+          }
+          break;
+        case 'correct':
+          if (cell.tue > predict.confirmedEpoch) {
+            predict.confirmedEpoch = cell.tue;
+            predictDirty(); // may unhide siblings from the same epoch
+          }
+          if (now - cell.predictionTime < GLITCH_THRESHOLD &&
+              predict.glitchTrigger > 0 &&
+              now - predict.lastQuickConfirmation >= GLITCH_REPAIR_MININTERVAL) {
+            predict.glitchTrigger -= 1;
+            predict.lastQuickConfirmation = now;
+          }
+          { // mosh: match the rest of the row to the actual renditions
+            const fg = gridFg(rowNum, cell.col), bg = gridBg(rowNum, cell.col);
+            for (let k = cell.col; k < grid.cols; k++) {
+              if (row[k].active) { row[k].fg = fg; row[k].bg = bg; }
+            }
+          }
+          dirtyRows.add(rowNum);
+          resetCell(cell);
+          break;
+        case 'correct-nocredit':
+          dirtyRows.add(rowNum);
+          resetCell(cell);
+          break;
+        case 'pending':
+          // long-outstanding predictions force display (and eventually underline)
+          if (now - cell.predictionTime >= GLITCH_FLAG_THRESHOLD) {
+            predict.glitchTrigger = GLITCH_REPAIR_COUNT * 2;
+          } else if (now - cell.predictionTime >= GLITCH_THRESHOLD &&
+                     predict.glitchTrigger < GLITCH_REPAIR_COUNT) {
+            predict.glitchTrigger = GLITCH_REPAIR_COUNT;
+          }
+          break;
+      }
+    }
+  }
+
+  // cursor: judge only the latest; an acked mismatch resets everything (mosh)
+  const cur = lastCursor();
+  if (cur) {
+    if (ackSeq != null && !cur.ackedAt && ackSeq >= cur.expirationSeq) cur.ackedAt = now;
+    if (cur.ackedAt && cur.row === grid.curRow && cur.col === grid.curCol) {
       dirtyRows.add(cur.row);
-      dirtyRows.add(grid.curRow);
-      predict.cursor = null;
+      predict.cursors = []; // settled and correct: server truth takes over
+    } else if (cur.ackedAt && now - cur.ackedAt >= ACK_ECHO_GRACE) {
+      predictReset();
+      return;
+    } else {
+      // drop older settled cursors, keep the pending chain
+      predict.cursors = predict.cursors.filter((c, i) =>
+        i === predict.cursors.length - 1 || !c.ackedAt);
     }
   }
   schedulePaint();
 }
 
-// no-echo contexts (password prompts, vim normal mode) may never produce a
-// frame; expire outstanding predictions on a timer too
+// judgments that need wall-clock time (echo grace elapsing, no-echo contexts
+// like password prompts) can't rely on a next frame arriving — re-reconcile
+// periodically and expire predictions that outlive any plausible echo
 setInterval(() => {
+  if (anyPending()) reconcilePredictions(null);
   const now = performance.now();
   const limit = Math.max(2 * (predict.srtt || 100), 500) + GLITCH_THRESHOLD;
-  if (predict.cells.length && now - predict.cells[0].sentAt > limit) {
-    killEpoch(predict.cells[0].epoch);
-    schedulePaint();
-  } else if (!predict.cells.length && predict.cursor && now - predict.cursor.sentAt > limit) {
-    dirtyRows.add(predict.cursor.row);
-    dirtyRows.add(grid.curRow);
-    predict.cursor = null;
-    schedulePaint();
+  let oldest = null;
+  for (const row of predict.overlays.values()) {
+    for (const c of row) {
+      if (c.active && (oldest == null || c.predictionTime < oldest.predictionTime)) oldest = c;
+    }
+  }
+  if (oldest && now - oldest.predictionTime > limit) {
+    killEpoch(oldest.tue);
+  } else if (!oldest && predict.cursors.length && now - lastCursor().predictionTime > limit) {
+    predictDirty();
+    predict.cursors = [];
   }
 }, 250);
 
@@ -385,22 +608,26 @@ function paintRow(r) {
     ctx.globalAlpha = 1;
   }
 
-  // prediction overlay: shown immediately, underlined until confirmed.
-  // Deviation from stock mosh (which hides a whole epoch until it confirms):
-  // we display one epoch past the confirmed one so typing right after Enter
-  // is instant; hiding only kicks in beyond an unconfirmed risky boundary
-  // (e.g. right after a misprediction was culled).
+  // prediction overlay: mosh paints only cells whose replacement differs
+  // from the framebuffer. Underline marks flagging (mosh) or unconfirmed
+  // (our deviation: cells show one epoch past confirmed instead of hiding).
   if (predictActive()) {
-    for (const p of predict.cells) {
-      if (p.row !== r || p.epoch > predict.confirmedEpoch + 1) continue;
-      const x = p.col * cellW;
-      ctx.fillStyle = color(grid.bg[base + p.col]);
-      ctx.fillRect(x, y, cellW, cellH);
-      ctx.font = `${FONT_SIZE}px ${FONT_STACK}`;
-      ctx.fillStyle = color(grid.fg[base + p.col] || 0xd4d4d4);
-      if (p.cp !== 32) ctx.fillText(String.fromCodePoint(p.cp), x, y + baseline, cellW);
-      if (predict.flagging || p.epoch > predict.confirmedEpoch) {
-        ctx.fillRect(x, y + cellH - 2, cellW, 1);
+    const orow = predict.overlays.get(r);
+    if (orow) {
+      for (let c = 0; c < grid.cols; c++) {
+        const p = orow[c];
+        if (!p.active || p.unknown || p.tue > predict.confirmedEpoch + 1) continue;
+        const i = base + c;
+        if (p.cp === grid.cp[i] && p.fg === grid.fg[i] && p.bg === grid.bg[i]) continue;
+        const x = c * cellW;
+        ctx.fillStyle = color(p.bg);
+        ctx.fillRect(x, y, cellW, cellH);
+        ctx.font = `${FONT_SIZE}px ${FONT_STACK}`;
+        ctx.fillStyle = color(p.fg);
+        if (p.cp > 32) ctx.fillText(String.fromCodePoint(p.cp), x, y + baseline, cellW);
+        if (predict.flagging || p.tue > predict.confirmedEpoch) {
+          ctx.fillRect(x, y + cellH - 2, cellW, 1);
+        }
       }
     }
   }
@@ -408,9 +635,8 @@ function paintRow(r) {
   // cursor overlay: predicted position while predictions are in flight
   // (outline while the epoch is tentative, solid once confirmed) — the
   // displayed cursor never snaps back to a stale server position
-  const predCursor = predictActive() && predict.cursor;
-  const dc = predCursor ? predict.cursor : { row: grid.curRow, col: grid.curCol };
-  const tentativeCursor = predCursor && predict.cursor.epoch > predict.confirmedEpoch;
+  const dc = displayedCursor();
+  const tentativeCursor = dc.tentative;
   if (grid.curVisible && dc.row === r && dc.col < grid.cols) {
     const i = base + dc.col;
     const x = dc.col * cellW;
@@ -692,12 +918,10 @@ window.addEventListener('keydown', (e) => {
   if (seq !== null) {
     e.preventDefault();
     const s = sendInput(seq);
-    // predict only typing-like input; escape sequences (arrows etc.) move the
-    // cursor in ways we don't model, so they just start a new epoch
-    const typing = seq === '\r' || seq === '\x7f' ||
-      (Array.from(seq).length === 1 && seq.codePointAt(0) >= 32);
-    if (typing) predictInput(seq, s);
-    else becomeTentative();
+    // the engine routes everything like mosh's new_user_byte: printables
+    // insert, backspace shifts left, CR predicts the newline, left/right
+    // arrows move the predicted cursor, everything else becomes tentative
+    predictInput(seq, s);
   }
 });
 
