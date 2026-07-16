@@ -62,10 +62,12 @@ const GLITCH_THRESHOLD = 250, GLITCH_FLAG_THRESHOLD = 5000;
 const GLITCH_REPAIR_COUNT = 10, GLITCH_REPAIR_MININTERVAL = 150;
 const ACK_ECHO_GRACE = 150; // our ack = "reached the pty", echo may lag a beat
 
+const CURSOR_ADOPT_GRACE = 50; // ms after ack before trusting the server cursor again
+
 const predict = {
   mode: ['adaptive', 'always', 'never'].includes(params.get('predict')) ? params.get('predict') : 'adaptive',
   cells: [],        // {row, col, cp, epoch, inputSeq, sentAt, ackedAt}
-  cursor: null,     // {row, col, epoch}
+  cursor: null,     // {row, col, epoch, inputSeq, sentAt, ackedAt}
   predictionEpoch: 1,
   confirmedEpoch: 0,
   srtt: null,
@@ -116,6 +118,16 @@ function killEpoch(epoch) {
   predict.glitchTrigger = GLITCH_REPAIR_COUNT * 2; // mispredicted: stay watchful
 }
 
+function setCursorPrediction(row, col, inputSeq, now) {
+  if (predict.cursor) dirtyRows.add(predict.cursor.row);
+  predict.cursor = {
+    row, col, epoch: predict.predictionEpoch,
+    inputSeq, sentAt: now, ackedAt: 0,
+  };
+  dirtyRows.add(row);
+  schedulePaint();
+}
+
 function predictInput(str, inputSeq) {
   if (predict.mode === 'never' || !haveFull) return;
   const now = performance.now();
@@ -124,18 +136,20 @@ function predictInput(str, inputSeq) {
     if (cp === 0x7f) { // backspace: retract our own pending prediction only
       if (predict.cells.length) {
         const p = predict.cells.pop();
-        predict.cursor = { row: p.row, col: p.col, epoch: predict.predictionEpoch };
-        dirtyRows.add(p.row);
-        schedulePaint();
+        setCursorPrediction(p.row, p.col, inputSeq, now);
       } else {
         becomeTentative();
       }
       continue;
     }
-    if (cp < 32 || (cp >= 0x1b && cp <= 0x1f)) { // control: risky, new epoch
+    if (cp === 0x0d) { // Enter: predict cursor to column 0 of the next row (as mosh does)
       becomeTentative();
-      if (predict.cursor) { dirtyRows.add(predict.cursor.row); schedulePaint(); }
-      predict.cursor = null;
+      const base = predict.cursor || { row: grid.curRow, col: grid.curCol };
+      setCursorPrediction(Math.min(base.row + 1, grid.rows - 1), 0, inputSeq, now);
+      continue;
+    }
+    if (cp < 32) { // other control: risky — new epoch, keep whatever cursor we have current
+      becomeTentative();
       continue;
     }
     const base = predict.cursor || { row: grid.curRow, col: grid.curCol };
@@ -147,9 +161,7 @@ function predictInput(str, inputSeq) {
       row: base.row, col: base.col, cp,
       epoch: predict.predictionEpoch, inputSeq, sentAt: now, ackedAt: 0,
     });
-    predict.cursor = { row: base.row, col: base.col + 1, epoch: predict.predictionEpoch };
-    dirtyRows.add(base.row);
-    schedulePaint();
+    setCursorPrediction(base.row, base.col + 1, inputSeq, now);
   }
 }
 
@@ -157,7 +169,10 @@ function reconcilePredictions(ackSeq) {
   if (!predict.cells.length && !predict.cursor) return;
   const now = performance.now();
   const surviving = [];
-  for (const p of predict.cells) {
+  let killAt = -1;
+  let i = 0;
+  for (; i < predict.cells.length; i++) {
+    const p = predict.cells[i];
     if (ackSeq != null && !p.ackedAt && ackSeq >= p.inputSeq) p.ackedAt = now;
     if (p.row < grid.rows && p.col < grid.cols && grid.cp[p.row * grid.cols + p.col] === p.cp) {
       // confirmed correct
@@ -175,9 +190,9 @@ function reconcilePredictions(ackSeq) {
     }
     if (p.ackedAt && now - p.ackedAt > ACK_ECHO_GRACE) {
       // frame provably includes this keystroke and the cell disagrees
-      killEpoch(p.epoch);
-      schedulePaint();
-      return;
+      killAt = p.epoch;
+      i++;
+      break;
     }
     if (now - p.sentAt > GLITCH_THRESHOLD) {
       predict.glitchTrigger = Math.max(predict.glitchTrigger, GLITCH_REPAIR_COUNT * 2);
@@ -185,12 +200,24 @@ function reconcilePredictions(ackSeq) {
     }
     surviving.push(p);
   }
+  for (; i < predict.cells.length; i++) surviving.push(predict.cells[i]);
   predict.cells = surviving;
-  if (!predict.cells.length && predict.cursor) {
-    // everything confirmed: snap cursor back to server truth
-    dirtyRows.add(predict.cursor.row);
-    predict.cursor = null;
-    dirtyRows.add(grid.curRow);
+  if (killAt >= 0) {
+    killEpoch(killAt);
+    schedulePaint();
+    return;
+  }
+  // Cursor handoff: adopt the server cursor only once a frame provably
+  // reflects the keystroke that placed the predicted cursor (plus a small
+  // echo grace) — never snap back to a stale position.
+  if (predict.cursor) {
+    const cur = predict.cursor;
+    if (ackSeq != null && !cur.ackedAt && ackSeq >= cur.inputSeq) cur.ackedAt = now;
+    if (cur.ackedAt && now - cur.ackedAt > CURSOR_ADOPT_GRACE && !predict.cells.length) {
+      dirtyRows.add(cur.row);
+      dirtyRows.add(grid.curRow);
+      predict.cursor = null;
+    }
   }
   schedulePaint();
 }
@@ -198,11 +225,15 @@ function reconcilePredictions(ackSeq) {
 // no-echo contexts (password prompts, vim normal mode) may never produce a
 // frame; expire outstanding predictions on a timer too
 setInterval(() => {
-  if (!predict.cells.length) return;
   const now = performance.now();
   const limit = Math.max(2 * (predict.srtt || 100), 500) + GLITCH_THRESHOLD;
-  if (now - predict.cells[0].sentAt > limit) {
+  if (predict.cells.length && now - predict.cells[0].sentAt > limit) {
     killEpoch(predict.cells[0].epoch);
+    schedulePaint();
+  } else if (!predict.cells.length && predict.cursor && now - predict.cursor.sentAt > limit) {
+    dirtyRows.add(predict.cursor.row);
+    dirtyRows.add(grid.curRow);
+    predict.cursor = null;
     schedulePaint();
   }
 }, 250);
@@ -356,14 +387,16 @@ function paintRow(r) {
     }
   }
 
-  // cursor overlay (at the predicted position when prediction is displayed)
-  const dc = (predictActive() && predict.cursor && predict.cursor.epoch <= predict.confirmedEpoch)
-    ? predict.cursor
-    : { row: grid.curRow, col: grid.curCol };
+  // cursor overlay: predicted position while predictions are in flight
+  // (outline while the epoch is tentative, solid once confirmed) — the
+  // displayed cursor never snaps back to a stale server position
+  const predCursor = predictActive() && predict.cursor;
+  const dc = predCursor ? predict.cursor : { row: grid.curRow, col: grid.curCol };
+  const tentativeCursor = predCursor && predict.cursor.epoch > predict.confirmedEpoch;
   if (grid.curVisible && dc.row === r && dc.col < grid.cols) {
     const i = base + dc.col;
     const x = dc.col * cellW;
-    if (focused) {
+    if (focused && !tentativeCursor) {
       ctx.fillStyle = color(grid.fg[i]);
       ctx.fillRect(x, y, cellW, cellH);
       const cp = grid.cp[i];
@@ -641,7 +674,12 @@ window.addEventListener('keydown', (e) => {
   if (seq !== null) {
     e.preventDefault();
     const s = sendInput(seq);
-    predictInput(seq, s);
+    // predict only typing-like input; escape sequences (arrows etc.) move the
+    // cursor in ways we don't model, so they just start a new epoch
+    const typing = seq === '\r' || seq === '\x7f' ||
+      (Array.from(seq).length === 1 && seq.codePointAt(0) >= 32);
+    if (typing) predictInput(seq, s);
+    else becomeTentative();
   }
 });
 

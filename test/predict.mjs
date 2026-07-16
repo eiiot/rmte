@@ -34,6 +34,7 @@ await page.keyboard.type('cho predicted');
 const t1 = await page.evaluate(() => ({
   cells: predict.cells.length,
   visible: predict.cells.filter((p) => p.epoch <= predict.confirmedEpoch).length,
+  cursorAhead: !!predict.cursor && predict.cursor.col === predict.cells[predict.cells.length - 1].col + 1,
 }));
 
 // let everything confirm, then run the command
@@ -47,18 +48,22 @@ const final = await page.evaluate(() => {
     for (let c = 0; c < grid.cols; c++) text += String.fromCodePoint(grid.cp[r * grid.cols + c] || 32);
     text += '\n';
   }
-  return { hasOutput: text.includes('predicted'), pending: predict.cells.length };
+  return {
+    hasOutput: text.includes('predicted'),
+    pending: predict.cells.length,
+    cursorReleased: predict.cursor === null,
+  };
 });
 
 await browser.close();
 
 console.log('srtt(sim):', Math.round(pre.srtt), 'active:', pre.active, 'mode:', pre.mode);
 console.log('warm-up: tracked', t0.cells, 'hidden:', t0.hidden);
-console.log('after confirm: tracked', t1.cells, 'instantly visible:', t1.visible);
-console.log('final: echoed:', final.hasOutput, 'pending:', final.pending);
+console.log('after confirm: tracked', t1.cells, 'instantly visible:', t1.visible, 'cursor ahead:', t1.cursorAhead);
+console.log('final: echoed:', final.hasOutput, 'pending:', final.pending, 'cursor released:', final.cursorReleased);
 console.log('errors:', errors.length ? errors : 'none');
 
-const pass = pre.active && t0.cells === 1 && t0.hidden && t1.visible > 0 &&
-             final.hasOutput && final.pending === 0 && !errors.length;
+const pass = pre.active && t0.cells === 1 && t0.hidden && t1.visible > 0 && t1.cursorAhead &&
+             final.hasOutput && final.pending === 0 && final.cursorReleased && !errors.length;
 console.log(pass ? 'PREDICT PASS' : 'PREDICT FAIL');
 process.exit(pass ? 0 : 1);
