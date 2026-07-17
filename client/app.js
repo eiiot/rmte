@@ -701,7 +701,7 @@ function applyFrame(buf) {
     readOnly = !!(flags & 1);
     if (readOnly) predict.mode = 'never';
     sessionName = new TextDecoder().decode(new Uint8Array(buf, 3));
-    document.title = `${sessionName}${readOnly ? ' (read-only)' : ''} — tachyon`;
+    document.title = `${sessionName}${readOnly ? ' (read-only)' : ''} — rmte`;
     updateHud();
     return;
   }

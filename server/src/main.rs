@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use engine::Engine;
 
 #[derive(Parser)]
-#[command(name = "tachyon", about = "Fast tmux streaming to the browser")]
+#[command(name = "rmte", about = "Fast tmux streaming to the browser")]
 struct Args {
     /// Default tmux session when the client doesn't specify ?session=
     #[arg(short, long, default_value = "main")]
@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = format!("{}:{}", args.bind, args.port);
     tracing::info!(
-        "tachyon listening on http://{addr} (default session: {})",
+        "rmte listening on http://{addr} (default session: {})",
         args.session
     );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -153,7 +153,7 @@ async fn ws_upgrade(
         return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
     }
     // Read-only is a property of the connection, decided by whoever
-    // establishes it (an auth layer / relay in front of tachyon).
+    // establishes it (an auth layer / relay in front of rmte).
     let read_only = matches!(q.get("ro").map(String::as_str), Some("1") | Some("true"));
     let engine = match get_or_spawn(&state, &session) {
         Ok(engine) => engine,

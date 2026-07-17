@@ -1,6 +1,6 @@
-// End-to-end test: connect to tachyon, keep a grid model from binary diffs,
+// End-to-end test: connect to rmte, keep a grid model from binary diffs,
 // type a command, verify it appears, and measure keystroke->frame latency.
-const URL = process.env.TACHYON_URL || 'ws://localhost:7861/ws';
+const URL = process.env.RMTE_URL || 'ws://localhost:7861/ws';
 
 const ws = new WebSocket(URL);
 ws.binaryType = 'arraybuffer';
@@ -60,7 +60,7 @@ function sendInput(str) {
   ws.send(msg);
 }
 
-const MARKER = 'tachyon-e2e-' + process.pid;
+const MARKER = 'rmte-e2e-' + process.pid;
 let typedAt = null;
 let firstEchoAt = null;
 let done = false;

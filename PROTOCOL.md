@@ -1,6 +1,6 @@
-# Tachyon wire protocol — version 1
+# Rmte wire protocol — version 1
 
-Tachyon speaks a compact binary protocol over a single WebSocket. All integers
+Rmte speaks a compact binary protocol over a single WebSocket. All integers
 are **little-endian**. The protocol is deliberately transport-agnostic: both
 directions are opaque byte messages, so any relay that can move binary
 WebSocket frames (a reverse proxy, an authenticated router, a tunnel) can sit
@@ -18,7 +18,7 @@ GET /ws[?session=<name>][&ro=1]   (WebSocket upgrade)
 - `ro` — `1` or `true` makes the connection **read-only**: the server ignores
   `input` and `resize` messages from it. Read-only is a property of the
   connection, chosen by whoever establishes it; an auth layer in front of
-  tachyon decides which clients may open writable connections.
+  rmte decides which clients may open writable connections.
 
 Multiple simultaneous connections to one session mirror the same screen
 (equivalent to two `tmux attach`es). The most recent `resize` from any
@@ -106,7 +106,7 @@ server replaces the dead engine on the next connection to that session.
 ### 5 — clipboard
 
 `[5][utf8 text]` — an application inside the session set the clipboard via
-OSC 52 (tachyon runs tmux with `set-clipboard on`). Clients should write the
+OSC 52 (rmte runs tmux with `set-clipboard on`). Clients should write the
 text to the system clipboard if permitted.
 
 ## Client → server messages

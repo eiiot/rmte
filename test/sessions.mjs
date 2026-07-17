@@ -1,10 +1,10 @@
 // Multi-session + read-only test: two sessions are isolated, the hello
 // message reports session/flags, and read-only connections can't type.
-const BASE = process.env.TACHYON_URL || 'ws://localhost:7861';
+const BASE = process.env.RMTE_URL || 'ws://localhost:7861';
 const HTTP = BASE.replace(/^ws/, 'http');
 
-const SES_A = 'tachyon-test-a';
-const SES_B = 'tachyon-test-b';
+const SES_A = 'rmte-test-a';
+const SES_B = 'rmte-test-b';
 
 function connect(session, ro) {
   const ws = new WebSocket(`${BASE}/ws?session=${session}${ro ? '&ro=1' : ''}`);

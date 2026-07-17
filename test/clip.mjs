@@ -1,10 +1,10 @@
 // Clipboard test: emit OSC 52 from inside the tmux session and expect a
 // MSG_CLIPBOARD (type 5) message with the decoded text.
-const URL = process.env.TACHYON_URL || 'ws://localhost:7861/ws';
+const URL = process.env.RMTE_URL || 'ws://localhost:7861/ws';
 const ws = new WebSocket(URL);
 ws.binaryType = 'arraybuffer';
 
-const EXPECT = 'tachyon-clip-' + process.pid;
+const EXPECT = 'rmte-clip-' + process.pid;
 const b64 = Buffer.from(EXPECT).toString('base64');
 let sent = false;
 

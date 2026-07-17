@@ -1,6 +1,6 @@
 // Flood test: run `seq 300000` in the session and measure what reaches the
 // client vs. what the raw byte stream would have been (~2MB for seq 300000).
-const URL = process.env.TACHYON_URL || 'ws://localhost:7861/ws';
+const URL = process.env.RMTE_URL || 'ws://localhost:7861/ws';
 const ws = new WebSocket(URL);
 ws.binaryType = 'arraybuffer';
 

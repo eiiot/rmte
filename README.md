@@ -1,10 +1,10 @@
-# tachyon
+# rmte
 
 Fast tmux streaming to the browser. The goal is for a remote tmux session to
 feel like a local terminal — mosh-grade responsiveness, in a browser tab.
 
 ```
-tmux ⇄ PTY ⇄ [ tachyon: alacritty emulation → damage diffs → frames ] ⇄ WebSocket ⇄ canvas client
+tmux ⇄ PTY ⇄ [ rmte: alacritty emulation → damage diffs → frames ] ⇄ WebSocket ⇄ canvas client
 ```
 
 ## Why it's fast
@@ -28,7 +28,7 @@ tmux ⇄ PTY ⇄ [ tachyon: alacritty emulation → damage diffs → frames ] �
 
 ```sh
 cargo build --release
-./target/release/tachyon --session main --port 7861
+./target/release/rmte --session main --port 7861
 # open http://localhost:7861
 ```
 
@@ -45,7 +45,7 @@ The RTT / session / prediction status HUD lives in the bottom-right corner.
 
 Binary WebSocket protocol, documented in [PROTOCOL.md](PROTOCOL.md). Both
 directions are opaque bytes end-to-end, so an authenticated relay or tunnel
-can sit in the middle without understanding the contents. Tachyon itself does
+can sit in the middle without understanding the contents. Rmte itself does
 no auth — bind it to localhost and put your auth layer in front.
 
 ## Tests
