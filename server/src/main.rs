@@ -1,11 +1,13 @@
 mod engine;
 mod palette;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::Html;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use bytes::{BufMut, BytesMut};
@@ -17,7 +19,7 @@ use engine::Engine;
 #[derive(Parser)]
 #[command(name = "tachyon", about = "Fast tmux streaming to the browser")]
 struct Args {
-    /// tmux session name (created if it doesn't exist)
+    /// Default tmux session when the client doesn't specify ?session=
     #[arg(short, long, default_value = "main")]
     session: String,
     /// Port to listen on
@@ -28,13 +30,30 @@ struct Args {
     bind: String,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
+struct AppState {
+    sessions: parking_lot::Mutex<HashMap<String, Arc<Engine>>>,
+    default_session: String,
+}
 
+fn valid_session(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Get the live engine for a tmux session, lazily attaching (and creating the
+/// session) on first use. A dead engine (tmux client exited) is replaced.
+fn get_or_spawn(state: &AppState, name: &str) -> anyhow::Result<Arc<Engine>> {
+    let mut map = state.sessions.lock();
+    if let Some(existing) = map.get(name) {
+        if !existing.is_closed() {
+            return Ok(existing.clone());
+        }
+    }
     let tmux_args: Vec<String> = [
-        "new-session", "-A", "-s", &args.session,
+        "new-session", "-A", "-s", name,
         // OSC 52 passthrough so tmux copy-mode / in-app copies reach the browser clipboard
         ";", "set-option", "-s", "set-clipboard", "on",
     ]
@@ -42,16 +61,33 @@ async fn main() -> anyhow::Result<()> {
     .map(|s| s.to_string())
     .collect();
     let engine = Engine::spawn(tmux_args, 120, 32)?;
+    map.insert(name.to_string(), engine.clone());
+    tracing::info!("attached engine to tmux session '{name}'");
+    Ok(engine)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+
+    let state = Arc::new(AppState {
+        sessions: parking_lot::Mutex::new(HashMap::new()),
+        default_session: args.session.clone(),
+    });
 
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/ws", get(ws_upgrade))
         .route("/text", get(text_dump))
-        .with_state(engine);
+        .with_state(state);
 
     let addr = format!("{}:{}", args.bind, args.port);
-    tracing::info!("tachyon listening on http://{addr} (session: {})", args.session);
+    tracing::info!(
+        "tachyon listening on http://{addr} (default session: {})",
+        args.session
+    );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -87,21 +123,69 @@ async fn app_js() -> ([(&'static str, &'static str); 2], &'static str) {
     )
 }
 
-async fn text_dump(State(engine): State<Arc<Engine>>) -> String {
-    engine.screen_text()
+async fn text_dump(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let session = q
+        .get("session")
+        .cloned()
+        .unwrap_or_else(|| state.default_session.clone());
+    if !valid_session(&session) {
+        return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
+    }
+    match get_or_spawn(&state, &session) {
+        Ok(engine) => engine.screen_text().into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn failed: {e}")).into_response(),
+    }
 }
 
-async fn ws_upgrade(ws: WebSocketUpgrade, State(engine): State<Arc<Engine>>) -> axum::response::Response {
-    ws.on_upgrade(move |socket| client_loop(socket, engine))
+async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let session = q
+        .get("session")
+        .cloned()
+        .unwrap_or_else(|| state.default_session.clone());
+    if !valid_session(&session) {
+        return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
+    }
+    // Read-only is a property of the connection, decided by whoever
+    // establishes it (an auth layer / relay in front of tachyon).
+    let read_only = matches!(q.get("ro").map(String::as_str), Some("1") | Some("true"));
+    let engine = match get_or_spawn(&state, &session) {
+        Ok(engine) => engine,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn failed: {e}"))
+                .into_response()
+        }
+    };
+    ws.on_upgrade(move |socket| client_loop(socket, engine, session, read_only))
 }
 
 const IN_INPUT: u8 = 1;
 const IN_RESIZE: u8 = 2;
 const IN_PING: u8 = 3;
 
-async fn client_loop(socket: WebSocket, engine: Arc<Engine>) {
+const PROTOCOL_VERSION: u8 = 1;
+const HELLO_FLAG_READ_ONLY: u8 = 1;
+
+async fn client_loop(socket: WebSocket, engine: Arc<Engine>, session: String, read_only: bool) {
     let (mut tx, mut rx) = socket.split();
     let mut frames = engine.frames.subscribe();
+
+    // hello: [0][protocol version][flags][utf8 session name]
+    let mut hello = BytesMut::with_capacity(3 + session.len());
+    hello.put_u8(engine::MSG_HELLO);
+    hello.put_u8(PROTOCOL_VERSION);
+    hello.put_u8(if read_only { HELLO_FLAG_READ_ONLY } else { 0 });
+    hello.put_slice(session.as_bytes());
+    if tx.send(Message::Binary(hello.freeze())).await.is_err() {
+        return;
+    }
+
     engine.request_full();
 
     loop {
@@ -129,11 +213,11 @@ async fn client_loop(socket: WebSocket, engine: Arc<Engine>) {
                         }
                         match data[0] {
                             // [1][u32 input seq][utf8 payload]
-                            IN_INPUT if data.len() >= 5 => {
+                            IN_INPUT if data.len() >= 5 && !read_only => {
                                 let seq = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
                                 engine.write_input(seq, &data[5..]);
                             }
-                            IN_RESIZE if data.len() >= 5 => {
+                            IN_RESIZE if data.len() >= 5 && !read_only => {
                                 let cols = u16::from_le_bytes([data[1], data[2]]);
                                 let rows = u16::from_le_bytes([data[3], data[4]]);
                                 engine.resize(cols, rows);

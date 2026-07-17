@@ -1,7 +1,7 @@
 'use strict';
 
 // ---- protocol constants (keep in sync with server/src/engine.rs) ----
-const MSG_FRAME = 1, MSG_PONG = 2, MSG_CLOSED = 4, MSG_CLIPBOARD = 5;
+const MSG_HELLO = 0, MSG_FRAME = 1, MSG_PONG = 2, MSG_CLOSED = 4, MSG_CLIPBOARD = 5;
 const IN_INPUT = 1, IN_RESIZE = 2, IN_PING = 3;
 const ATTR_BOLD = 1, ATTR_ITALIC = 2, ATTR_UNDERLINE = 4, ATTR_DIM = 8,
       ATTR_STRIKEOUT = 16, ATTR_WIDE = 32, ATTR_SPACER = 64;
@@ -11,6 +11,9 @@ const MODE_APP_CURSOR = 1, MODE_BRACKETED_PASTE = 2, MODE_MOUSE = 4,
 
 const params = new URLSearchParams(location.search);
 const simLag = Math.max(0, +(params.get('lag') || 0)); // simulated extra RTT, ms
+const SESSION = params.get('session'); // null = server default
+let readOnly = ['1', 'true'].includes(params.get('ro')); // confirmed by server hello
+let sessionName = SESSION || '';
 
 const canvas = document.getElementById('term');
 const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
@@ -692,6 +695,16 @@ function applyFrame(buf) {
   const v = new DataView(buf);
   let o = 0;
   const type = v.getUint8(o); o += 1;
+  if (type === MSG_HELLO) {
+    // [version][flags][utf8 session name]
+    const flags = v.getUint8(2);
+    readOnly = !!(flags & 1);
+    if (readOnly) predict.mode = 'never';
+    sessionName = new TextDecoder().decode(new Uint8Array(buf, 3));
+    document.title = `${sessionName}${readOnly ? ' (read-only)' : ''} — tachyon`;
+    updateHud();
+    return;
+  }
   if (type === MSG_PONG) {
     const sent = v.getFloat64(1, true);
     rtt = performance.now() - sent;
@@ -779,7 +792,11 @@ let focused = document.hasFocus();
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const wsParams = new URLSearchParams();
+  if (SESSION) wsParams.set('session', SESSION);
+  if (readOnly) wsParams.set('ro', '1');
+  const qs = wsParams.toString();
+  ws = new WebSocket(`${proto}://${location.host}/ws${qs ? '?' + qs : ''}`);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     connected = true;
@@ -807,6 +824,7 @@ function send(bytes) {
 const utf8 = new TextEncoder();
 let inputSeq = 0;
 function sendInput(str) {
+  if (readOnly) return 0;
   inputSeq += 1;
   const payload = utf8.encode(str);
   const msg = new Uint8Array(5 + payload.length);
@@ -818,6 +836,7 @@ function sendInput(str) {
 }
 
 function sendResize() {
+  if (readOnly) return;
   const { cols, rows } = viewportGrid();
   const msg = new Uint8Array(5);
   msg[0] = IN_RESIZE;
@@ -838,8 +857,10 @@ function updateHud() {
   hud.classList.remove('bad');
   const ms = rtt == null ? '–' : rtt < 10 ? rtt.toFixed(1) : Math.round(rtt);
   const parts = [`${ms}ms`, `${grid.cols}×${grid.rows}`];
+  if (sessionName) parts.unshift(sessionName);
+  if (readOnly) parts.push('read-only');
   if (simLag) parts.push(`+${simLag}ms lag`);
-  if (predict.mode !== 'adaptive') parts.push(`pred:${predict.mode}`);
+  if (!readOnly && predict.mode !== 'adaptive') parts.push(`pred:${predict.mode}`);
   else if (predictActive()) parts.push('pred:on');
   hud.textContent = parts.join(' · ');
 }

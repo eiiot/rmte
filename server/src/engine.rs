@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, Notify};
 
 use crate::palette;
 
+pub const MSG_HELLO: u8 = 0;
 pub const MSG_FRAME: u8 = 1;
 pub const MSG_PONG: u8 = 2;
 pub const MSG_CLOSED: u8 = 4;
@@ -80,6 +81,7 @@ pub struct Engine {
     // wrong display.)
     last_input: AtomicU32,
     last_cursor: Mutex<(u16, u16)>,
+    closed: AtomicBool,
 }
 
 impl Engine {
@@ -125,6 +127,7 @@ impl Engine {
             seq: AtomicU32::new(0),
             last_input: AtomicU32::new(0),
             last_cursor: Mutex::new((0, 0)),
+            closed: AtomicBool::new(false),
         });
 
         // PTY writer thread: browser input + terminal query replies (DSR etc.)
@@ -155,6 +158,7 @@ impl Engine {
                 }
             }
             let _ = child.wait();
+            reader_engine.closed.store(true, Ordering::Relaxed);
             let mut msg = BytesMut::with_capacity(1);
             msg.put_u8(MSG_CLOSED);
             let _ = reader_engine.frames.send(msg.freeze());
@@ -174,6 +178,10 @@ impl Engine {
         });
 
         Ok(engine)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
 
     pub fn request_full(&self) {
