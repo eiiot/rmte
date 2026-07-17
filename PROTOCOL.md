@@ -22,7 +22,7 @@ GET /ws[?session=<name>][&ro=1]   (WebSocket upgrade)
 ```
 
 - `session` — tmux session name to attach to (created via `tmux new-session -A`
-  if it doesn't exist). Must match `[A-Za-z0-9._-]{1,64}`. Defaults to the
+  if it doesn't exist). Must match `[A-Za-z0-9._-]{1,200}`. Defaults to the
   server's `--session` value.
 - `ro` — `1` or `true` makes the connection **read-only**: the server ignores
   `input` and `resize` messages from it. Read-only is a property of the

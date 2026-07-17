@@ -44,7 +44,7 @@ struct AppState {
 
 fn valid_session(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 64
+        && name.len() <= 200
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
