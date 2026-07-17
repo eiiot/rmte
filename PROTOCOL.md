@@ -148,6 +148,11 @@ those itself; a relay maps its own token to the right session and read-only
 state. With no override the client behaves standalone and appends
 `session`/`ro` from its own query.
 
+`window.RMTE_NO_RESIZE` (or `?noresize=1`) keeps the connection interactive
+(keystrokes and mouse still flow) but suppresses resize messages, so an
+embedder viewing a session it doesn't own won't reshape it to the viewer's
+viewport. This differs from `ro`, which blocks all input.
+
 ## Versioning
 
 Breaking changes bump the `version` byte in the hello message; clients must

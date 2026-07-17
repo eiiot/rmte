@@ -14,6 +14,12 @@ const simLag = Math.max(0, +(params.get('lag') || 0)); // simulated extra RTT, m
 const SESSION = params.get('session'); // null = server default
 let readOnly = ['1', 'true'].includes(params.get('ro')); // confirmed by server hello
 let sessionName = SESSION || '';
+// Interactive-but-don't-drive-resize mode: keystrokes/mouse still flow, but the
+// client never sends resize, so it won't reshape a session sized by its owner
+// (e.g. an embedder viewing an agent's terminal). Set via ?noresize=1 or
+// window.RMTE_NO_RESIZE.
+const noResize = ['1', 'true'].includes(params.get('noresize')) ||
+  (typeof window !== 'undefined' && !!window.RMTE_NO_RESIZE);
 
 const canvas = document.getElementById('term');
 const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
@@ -862,7 +868,7 @@ function sendInput(str) {
 }
 
 function sendResize() {
-  if (readOnly) return;
+  if (readOnly || noResize) return;
   const { cols, rows } = viewportGrid();
   const msg = new Uint8Array(5);
   msg[0] = IN_RESIZE;
