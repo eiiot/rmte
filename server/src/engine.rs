@@ -97,6 +97,10 @@ impl Engine {
         let mut cmd = CommandBuilder::new("tmux");
         cmd.args(tmux_args.iter().map(|s| s.as_str()));
         cmd.env("TERM", "xterm-256color");
+        // The PTY client env is synthetic; pin a UTF-8 locale so tmux (and
+        // anything locale-sensitive in the client path) never falls back to
+        // ASCII when rmte runs under a service manager with no LANG set.
+        cmd.env("LANG", "en_US.UTF-8");
         // Scrub inherited tmux routing so which server we attach is decided
         // solely by our arguments (an explicit `-S` or the true default), not
         // by whatever environment rmte's parent process happened to have.

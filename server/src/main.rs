@@ -84,7 +84,10 @@ fn get_or_spawn(
             return Ok(existing.clone());
         }
     }
-    let mut tmux_args: Vec<String> = Vec::new();
+    // -u forces the tmux client into UTF-8 mode regardless of locale. rmte
+    // often runs under daemons/service managers with no LANG/LC_* set, and a
+    // non-UTF-8 tmux client replaces every non-ASCII glyph with underscores.
+    let mut tmux_args: Vec<String> = vec!["-u".to_string()];
     if let Some(socket) = socket {
         tmux_args.push("-S".to_string());
         tmux_args.push(socket.to_string());
