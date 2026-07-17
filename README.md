@@ -32,9 +32,13 @@ cargo build --release
 # open http://localhost:7861
 ```
 
+- `--listen unix:<path>` — serve on a Unix domain socket (0600) instead of a
+  TCP port, for embedding behind a local auth layer with no open port
 - `?session=<name>` — attach to (or create) a specific tmux session; engines
   spawn lazily per session
 - `?ro=1` — read-only connection (input and resize ignored server-side)
+- `?ws=<url>` / `window.RMTE_WS_URL` — point the client at an external
+  WebSocket endpoint (for relays/embedders) instead of its own origin
 - `?lag=150` — simulate 150ms of extra RTT to feel the prediction engine work
 - `?predict=always|adaptive|never` — prediction display mode (default
   adaptive, like mosh)
@@ -57,6 +61,7 @@ node test/e2e.mjs        # keystroke -> frame latency through the full stack
 node test/flood.mjs      # output flood coalescing
 node test/clip.mjs       # OSC 52 clipboard passthrough
 node test/sessions.mjs   # multi-session isolation + read-only enforcement
+node test/unix-socket.mjs     # serving over a 0600 unix socket (needs --listen)
 node test/predict.mjs    # prediction engine semantics under 300ms lag
 node test/cursor.mjs     # displayed cursor never moves backward under lag
 node test/clear.mjs      # prediction ghosts don't outlive a screen clear

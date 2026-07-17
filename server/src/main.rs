@@ -22,12 +22,19 @@ struct Args {
     /// Default tmux session when the client doesn't specify ?session=
     #[arg(short, long, default_value = "main")]
     session: String,
-    /// Port to listen on
+    /// Port to listen on (TCP mode)
     #[arg(short, long, default_value = "7861")]
     port: u16,
-    /// Bind address
+    /// Bind address (TCP mode)
     #[arg(long, default_value = "127.0.0.1")]
     bind: String,
+    /// Listen on a Unix domain socket instead of TCP, e.g.
+    /// `--listen unix:/run/rmte.sock`. The socket is created with 0600
+    /// permissions, so only the owning user can connect — filesystem
+    /// permissions become the access control and no TCP port is opened.
+    /// Overrides --bind/--port when set.
+    #[arg(long)]
+    listen: Option<String>,
 }
 
 struct AppState {
@@ -83,12 +90,50 @@ async fn main() -> anyhow::Result<()> {
         .route("/text", get(text_dump))
         .with_state(state);
 
-    let addr = format!("{}:{}", args.bind, args.port);
+    match &args.listen {
+        Some(spec) => {
+            let path = spec.strip_prefix("unix:").ok_or_else(|| {
+                anyhow::anyhow!("--listen must be of the form unix:/path/to/socket")
+            })?;
+            serve_unix(app, path, &args.session).await
+        }
+        None => {
+            let addr = format!("{}:{}", args.bind, args.port);
+            tracing::info!(
+                "rmte listening on http://{addr} (default session: {})",
+                args.session
+            );
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            axum::serve(listener, app).await?;
+            Ok(())
+        }
+    }
+}
+
+/// Serve on a Unix domain socket locked to the owning user (0600). A stale
+/// socket file from a previous run is removed first. Because the socket is
+/// only reachable through the filesystem, the OS permission bits are the
+/// access control — there is no port for other hosts or (with 0600) other
+/// local users to reach.
+async fn serve_unix(app: Router, path: &str, default_session: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::anyhow!("could not remove stale socket {path}: {e}")),
+    }
+    // Restrict the socket to the owner before anyone can connect: create it
+    // under a 0177 umask so it is born 0600, then assert the mode explicitly.
+    let prev_umask = unsafe { libc::umask(0o177) };
+    let listener = tokio::net::UnixListener::bind(path);
+    unsafe { libc::umask(prev_umask) };
+    let listener = listener?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+
     tracing::info!(
-        "rmte listening on http://{addr} (default session: {})",
-        args.session
+        "rmte listening on unix:{path} (0600, default session: {default_session})"
     );
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }

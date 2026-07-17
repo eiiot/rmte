@@ -790,13 +790,39 @@ function decodeLines(v, o, lineCount, dirty) {
 let ws = null, connected = false, rtt = null;
 let focused = document.hasFocus();
 
+// Resolve the WebSocket endpoint. By default the client dials its own origin
+// (`/ws`), which is right when rmte serves the page directly. An embedder
+// (e.g. a router that vendors this client and relays frames from elsewhere)
+// can override the endpoint by setting `window.RMTE_WS_URL` before this script
+// runs, or by passing `?ws=<url>` — letting the client point at a relay
+// instead of at rmte directly, with no rmte-side knowledge of the embedder.
+// The embedder-supplied endpoint (window.RMTE_WS_URL or ?ws=), if any. When
+// set, the embedder owns the full endpoint including session/ro routing (a
+// relay maps its own token to the right session and read-only state), so the
+// client does NOT append session/ro. When absent, the client dials its own
+// origin `/ws` and appends session/ro from its query — the standalone case.
+function wsOverride() {
+  return (typeof window !== 'undefined' && window.RMTE_WS_URL) || params.get('ws') || null;
+}
+
 function connect() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const wsParams = new URLSearchParams();
-  if (SESSION) wsParams.set('session', SESSION);
-  if (readOnly) wsParams.set('ro', '1');
-  const qs = wsParams.toString();
-  ws = new WebSocket(`${proto}://${location.host}/ws${qs ? '?' + qs : ''}`);
+  const override = wsOverride();
+  let url;
+  if (override) {
+    if (/^wss?:\/\//i.test(override)) url = override;
+    else if (override.startsWith('/')) {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      url = `${proto}://${location.host}${override}`;
+    } else url = new URL(override, location.href).href.replace(/^http/, 'ws');
+  } else {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsParams = new URLSearchParams();
+    if (SESSION) wsParams.set('session', SESSION);
+    if (readOnly) wsParams.set('ro', '1');
+    const qs = wsParams.toString();
+    url = `${proto}://${location.host}/ws${qs ? '?' + qs : ''}`;
+  }
+  ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     connected = true;

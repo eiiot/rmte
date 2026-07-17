@@ -827,6 +827,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "libc",
  "parking_lot",
  "portable-pty",
  "tokio",

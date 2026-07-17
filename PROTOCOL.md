@@ -6,6 +6,15 @@ directions are opaque byte messages, so any relay that can move binary
 WebSocket frames (a reverse proxy, an authenticated router, a tunnel) can sit
 between the client and the server without understanding the contents.
 
+## Listening
+
+By default rmte serves HTTP + WebSocket on a TCP port (`--port`, `--bind`).
+For embedding behind an auth layer on the same host, `--listen unix:<path>`
+serves on a Unix domain socket created with 0600 permissions instead: no TCP
+port is opened and only the owning user can connect, so the OS filesystem
+permissions are the access control. rmte itself performs no authentication in
+either mode — bind it privately and put your auth layer in front.
+
 ## Connection
 
 ```
@@ -126,6 +135,18 @@ to 10–500 × 4–300. Ignored on read-only connections.
 
 `[3][payload]` — server echoes the payload back as a pong. The reference
 client sends `[3][f64 timestamp]` every 2s to measure RTT.
+
+## Embedding the client
+
+The bundled `client/app.js` dials its own origin's `/ws` by default. An
+embedder that vendors the client and relays frames from elsewhere can redirect
+it without modification by setting `window.RMTE_WS_URL` (before the script
+runs) or passing `?ws=<url>` — an absolute `ws(s)://` URL, an origin-relative
+path, or a page-relative URL. When an override is set the embedder owns the
+full endpoint including `session`/`ro` routing, so the client does not append
+those itself; a relay maps its own token to the right session and read-only
+state. With no override the client behaves standalone and appends
+`session`/`ro` from its own query.
 
 ## Versioning
 
