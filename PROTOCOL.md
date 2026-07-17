@@ -28,6 +28,17 @@ GET /ws[?session=<name>][&ro=1]   (WebSocket upgrade)
   `input` and `resize` messages from it. Read-only is a property of the
   connection, chosen by whoever establishes it; an auth layer in front of
   rmte decides which clients may open writable connections.
+- `socket` — absolute path of a tmux server socket (`tmux -S`) to attach on,
+  for hosts whose sessions live on a non-default tmux server. Only honored
+  when rmte runs with `--allow-socket-param` (enable it only for trusted
+  listeners, e.g. a 0600 unix socket); otherwise the request is rejected.
+  The path must exist — this selects a server, it never creates one. Engines
+  are keyed by (socket, session). rmte also scrubs inherited `TMUX`/
+  `TMUX_TMPDIR` from the tmux client's environment, so without `socket` the
+  attach deterministically hits the true default server. Beware tmux's
+  attach-or-create: a session name valid on one server silently creates an
+  empty session on another, so embedders with multiple servers must pass the
+  right socket per session.
 
 Multiple simultaneous connections to one session mirror the same screen
 (equivalent to two `tmux attach`es). The most recent `resize` from any

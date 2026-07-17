@@ -35,11 +35,22 @@ struct Args {
     /// Overrides --bind/--port when set.
     #[arg(long)]
     listen: Option<String>,
+    /// Allow connections to select a tmux server via `?socket=<abs path>`
+    /// (`tmux -S`). For embedders whose sessions live on a non-default tmux
+    /// server (or several, during a migration). Off by default: with it
+    /// disabled, a `socket` parameter is rejected, so untrusted clients can't
+    /// point rmte at arbitrary sockets. Enable only when everyone who can
+    /// reach the listener is trusted (e.g. a 0600 unix-socket listener).
+    #[arg(long)]
+    allow_socket_param: bool,
 }
 
 struct AppState {
-    sessions: parking_lot::Mutex<HashMap<String, Arc<Engine>>>,
+    /// Engines keyed by (tmux server socket, session name); `None` socket is
+    /// the environment-default server.
+    sessions: parking_lot::Mutex<HashMap<(Option<String>, String), Arc<Engine>>>,
     default_session: String,
+    allow_socket_param: bool,
 }
 
 fn valid_session(name: &str) -> bool {
@@ -50,26 +61,49 @@ fn valid_session(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// A `?socket=` value must be an absolute path to an existing socket file —
+/// this selects a tmux server, it never creates one.
+fn valid_tmux_socket(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    p.is_absolute() && p.exists()
+}
+
 /// Get the live engine for a tmux session, lazily attaching (and creating the
 /// session) on first use. A dead engine (tmux client exited) is replaced.
-fn get_or_spawn(state: &AppState, name: &str) -> anyhow::Result<Arc<Engine>> {
+/// `socket` selects the tmux server (`tmux -S`); `None` uses the
+/// environment-default server.
+fn get_or_spawn(
+    state: &AppState,
+    socket: Option<&str>,
+    name: &str,
+) -> anyhow::Result<Arc<Engine>> {
+    let key = (socket.map(str::to_string), name.to_string());
     let mut map = state.sessions.lock();
-    if let Some(existing) = map.get(name) {
+    if let Some(existing) = map.get(&key) {
         if !existing.is_closed() {
             return Ok(existing.clone());
         }
     }
-    let tmux_args: Vec<String> = [
-        "new-session", "-A", "-s", name,
-        // OSC 52 passthrough so tmux copy-mode / in-app copies reach the browser clipboard
-        ";", "set-option", "-s", "set-clipboard", "on",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let mut tmux_args: Vec<String> = Vec::new();
+    if let Some(socket) = socket {
+        tmux_args.push("-S".to_string());
+        tmux_args.push(socket.to_string());
+    }
+    tmux_args.extend(
+        [
+            "new-session", "-A", "-s", name,
+            // OSC 52 passthrough so tmux copy-mode / in-app copies reach the browser clipboard
+            ";", "set-option", "-s", "set-clipboard", "on",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
     let engine = Engine::spawn(tmux_args, 120, 32)?;
-    map.insert(name.to_string(), engine.clone());
-    tracing::info!("attached engine to tmux session '{name}'");
+    map.insert(key, engine.clone());
+    tracing::info!(
+        "attached engine to tmux session '{name}'{}",
+        socket.map(|s| format!(" (server {s})")).unwrap_or_default()
+    );
     Ok(engine)
 }
 
@@ -81,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         sessions: parking_lot::Mutex::new(HashMap::new()),
         default_session: args.session.clone(),
+        allow_socket_param: args.allow_socket_param,
     });
 
     let app = Router::new()
@@ -168,6 +203,33 @@ async fn app_js() -> ([(&'static str, &'static str); 2], &'static str) {
     )
 }
 
+/// Extract and validate the optional `?socket=` tmux server selector.
+/// Returns `Err(response)` when the parameter is present but disallowed or
+/// invalid.
+fn tmux_socket_param<'q>(
+    state: &AppState,
+    q: &'q HashMap<String, String>,
+) -> Result<Option<&'q str>, Response> {
+    let Some(socket) = q.get("socket") else {
+        return Ok(None);
+    };
+    if !state.allow_socket_param {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "socket parameter not allowed (start rmte with --allow-socket-param)",
+        )
+            .into_response());
+    }
+    if !valid_tmux_socket(socket) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "socket must be an absolute path to an existing tmux server socket",
+        )
+            .into_response());
+    }
+    Ok(Some(socket.as_str()))
+}
+
 async fn text_dump(
     State(state): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
@@ -179,7 +241,11 @@ async fn text_dump(
     if !valid_session(&session) {
         return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
     }
-    match get_or_spawn(&state, &session) {
+    let socket = match tmux_socket_param(&state, &q) {
+        Ok(socket) => socket,
+        Err(response) => return response,
+    };
+    match get_or_spawn(&state, socket, &session) {
         Ok(engine) => engine.screen_text().into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn failed: {e}")).into_response(),
     }
@@ -197,10 +263,14 @@ async fn ws_upgrade(
     if !valid_session(&session) {
         return (StatusCode::BAD_REQUEST, "invalid session name").into_response();
     }
+    let socket = match tmux_socket_param(&state, &q) {
+        Ok(socket) => socket,
+        Err(response) => return response,
+    };
     // Read-only is a property of the connection, decided by whoever
     // establishes it (an auth layer / relay in front of rmte).
     let read_only = matches!(q.get("ro").map(String::as_str), Some("1") | Some("true"));
-    let engine = match get_or_spawn(&state, &session) {
+    let engine = match get_or_spawn(&state, socket, &session) {
         Ok(engine) => engine,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn failed: {e}"))

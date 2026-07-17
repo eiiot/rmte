@@ -61,6 +61,7 @@ node test/e2e.mjs        # keystroke -> frame latency through the full stack
 node test/flood.mjs      # output flood coalescing
 node test/clip.mjs       # OSC 52 clipboard passthrough
 node test/sessions.mjs   # multi-session isolation + read-only enforcement
+node test/socket-param.mjs    # tmux server selection via ?socket= (two instances)
 node test/unix-socket.mjs     # serving over a 0600 unix socket (needs --listen)
 node test/predict.mjs    # prediction engine semantics under 300ms lag
 node test/cursor.mjs     # displayed cursor never moves backward under lag

@@ -97,6 +97,11 @@ impl Engine {
         let mut cmd = CommandBuilder::new("tmux");
         cmd.args(tmux_args.iter().map(|s| s.as_str()));
         cmd.env("TERM", "xterm-256color");
+        // Scrub inherited tmux routing so which server we attach is decided
+        // solely by our arguments (an explicit `-S` or the true default), not
+        // by whatever environment rmte's parent process happened to have.
+        cmd.env_remove("TMUX");
+        cmd.env_remove("TMUX_TMPDIR");
         let mut child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
 
