@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use engine::Engine;
 
 #[derive(Parser)]
-#[command(name = "rmte", about = "Fast tmux streaming to the browser")]
+#[command(name = "rmte", version, about = "Fast tmux streaming to the browser")]
 struct Args {
     /// Default tmux session when the client doesn't specify ?session=
     #[arg(short, long, default_value = "main")]
