@@ -376,6 +376,10 @@ async fn ws_upgrade(
 const IN_INPUT: u8 = 1;
 const IN_RESIZE: u8 = 2;
 const IN_PING: u8 = 3;
+/// Ask the server to rebroadcast a full frame. Embedders inject this when a
+/// new viewer joins an already-pumping relay, so late joiners get a complete
+/// screen without tearing down and re-establishing the connection.
+const IN_REFRESH: u8 = 4;
 
 const PROTOCOL_VERSION: u8 = 1;
 const HELLO_FLAG_READ_ONLY: u8 = 1;
@@ -429,6 +433,9 @@ async fn client_loop(socket: WebSocket, engine: Arc<Engine>, session: String, re
                                 let cols = u16::from_le_bytes([data[1], data[2]]);
                                 let rows = u16::from_le_bytes([data[3], data[4]]);
                                 engine.resize(cols, rows);
+                            }
+                            IN_REFRESH => {
+                                engine.request_full();
                             }
                             IN_PING => {
                                 let mut pong = BytesMut::with_capacity(data.len());

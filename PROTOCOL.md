@@ -147,6 +147,13 @@ to 10–500 × 4–300. Ignored on read-only connections.
 `[3][payload]` — server echoes the payload back as a pong. The reference
 client sends `[3][f64 timestamp]` every 2s to measure RTT.
 
+### 4 — refresh
+
+`[4]` — ask the server to rebroadcast a full frame to every connection on
+this session. Relays inject this when a late viewer joins an existing
+connection, instead of reconnecting to force a snapshot. Allowed on
+read-only connections (it reveals nothing new and writes nothing).
+
 ## Embedding the client
 
 The bundled `client/app.js` dials its own origin's `/ws` by default. An
