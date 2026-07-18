@@ -25,20 +25,47 @@ const canvas = document.getElementById('term');
 const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 const hud = document.getElementById('hud');
 
-const FONT_SIZE = 14;
+const BASE_FONT_SIZE = 14;
 const FONT_STACK = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
 const DEFAULT_BG = '#121212';
 
 // ---- font metrics ----
+let fontSize = BASE_FONT_SIZE;
 let cellW, cellH, baseline, dpr;
+// letterbox origin when the fitted grid is smaller than the viewport
+let originX = 0, originY = 0;
 function measureFont() {
   dpr = window.devicePixelRatio || 1;
-  ctx.font = `${FONT_SIZE}px ${FONT_STACK}`;
+  ctx.font = `${fontSize}px ${FONT_STACK}`;
   cellW = ctx.measureText('M').width;
-  cellH = Math.ceil(FONT_SIZE * 1.3);
-  baseline = Math.round(FONT_SIZE * 1.02);
+  cellH = Math.ceil(fontSize * 1.3);
+  baseline = Math.round(fontSize * 1.02);
 }
 measureFont();
+// monospace advance per px of font size, for fit-to-viewport math
+const CELL_RATIO = (() => {
+  ctx.font = `100px ${FONT_STACK}`;
+  return ctx.measureText('M').width / 100;
+})();
+measureFont(); // restore ctx.font side effects
+
+// Fit-to-viewport: when this connection doesn't drive the session's size
+// (read-only or noresize viewers), scale the font so the entire grid fits the
+// browser window, and center it. Connections that drive sizing keep the fixed
+// base font — the grid is already shaped to the viewport.
+function fitToViewport() {
+  if (!(noResize || readOnly)) return;
+  if (!grid.cols || !grid.rows) return;
+  const fsW = window.innerWidth / (grid.cols * CELL_RATIO);
+  const fsH = window.innerHeight / (grid.rows * 1.3);
+  const fs = Math.max(4, Math.min(28, Math.floor(Math.min(fsW, fsH) * 2) / 2));
+  if (fs !== fontSize) {
+    fontSize = fs;
+    measureFont();
+  }
+  originX = Math.max(0, Math.floor((window.innerWidth - grid.cols * cellW) / 2));
+  originY = Math.max(0, Math.floor((window.innerHeight - grid.rows * cellH) / 2));
+}
 
 // ---- grid model ----
 const grid = {
@@ -569,6 +596,9 @@ function fitCanvas() {
   ctx.textBaseline = 'alphabetic';
   ctx.fillStyle = DEFAULT_BG;
   ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+  // all grid drawing happens in grid coordinates; letterboxing rides the
+  // canvas transform so paint and overlay code stay origin-agnostic
+  ctx.setTransform(dpr, 0, 0, dpr, originX * dpr, originY * dpr);
 }
 
 function viewportGrid() {
@@ -622,7 +652,7 @@ function paintRow(r) {
       if (attr & ATTR_STRIKEOUT) ctx.fillRect(x, y + Math.round(cellH / 2), w, 1);
     }
     if (cp === 32 || cp === 0) continue;
-    let font = `${FONT_SIZE}px ${FONT_STACK}`;
+    let font = `${fontSize}px ${FONT_STACK}`;
     if (attr & ATTR_BOLD) font = '600 ' + font;
     if (attr & ATTR_ITALIC) font = 'italic ' + font;
     ctx.font = font;
@@ -646,7 +676,7 @@ function paintRow(r) {
         const x = c * cellW;
         ctx.fillStyle = color(p.bg);
         ctx.fillRect(x, y, cellW, cellH);
-        ctx.font = `${FONT_SIZE}px ${FONT_STACK}`;
+        ctx.font = `${fontSize}px ${FONT_STACK}`;
         ctx.fillStyle = color(p.fg);
         if (p.cp > 32) ctx.fillText(String.fromCodePoint(p.cp), x, y + baseline, cellW);
         if (predict.flagging || p.tue > predict.confirmedEpoch) {
@@ -750,6 +780,7 @@ function applyFrame(buf) {
     grid.modes = modes;
     decodeLines(v, o, lineCount);
     grid.curRow = curRow; grid.curCol = curCol; grid.curVisible = curVisible;
+    fitToViewport(); // dims changed: refit non-driving viewers before painting
     paintAll();
     updateHud();
     return;
@@ -825,6 +856,8 @@ function connect() {
     const wsParams = new URLSearchParams();
     if (SESSION) wsParams.set('session', SESSION);
     if (readOnly) wsParams.set('ro', '1');
+    // the server honors noresize too (engine follow mode); forward it
+    if (noResize) wsParams.set('noresize', '1');
     const qs = wsParams.toString();
     url = `${proto}://${location.host}/ws${qs ? '?' + qs : ''}`;
   }
@@ -1006,8 +1039,8 @@ window.addEventListener('paste', (e) => {
 // ---- mouse ----
 function mouseCell(e) {
   return {
-    x: Math.min(grid.cols, Math.max(1, Math.floor(e.clientX / cellW) + 1)),
-    y: Math.min(grid.rows, Math.max(1, Math.floor(e.clientY / cellH) + 1)),
+    x: Math.min(grid.cols, Math.max(1, Math.floor((e.clientX - originX) / cellW) + 1)),
+    y: Math.min(grid.rows, Math.max(1, Math.floor((e.clientY - originY) / cellH) + 1)),
   };
 }
 
@@ -1126,7 +1159,12 @@ window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
     measureFont();
-    sendResize();
+    if (noResize || readOnly) {
+      fitToViewport();
+      if (haveFull) paintAll();
+    } else {
+      sendResize();
+    }
   }, 120);
 });
 window.addEventListener('focus', () => { focused = true; if (haveFull) { dirtyRows.add(grid.curRow); schedulePaint(); } });
