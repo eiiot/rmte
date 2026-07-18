@@ -323,7 +323,14 @@ async fn text_dump(
         Ok(socket) => socket,
         Err(response) => return response,
     };
-    match get_or_spawn(&state, socket, &session, false) {
+    // Honor noresize here too: /text lazily creates engines, and a debug or
+    // health probe must not create a non-follow engine (fixed 120x32, resizes
+    // the window) for a session an embedder will view in follow mode.
+    let follow = matches!(
+        q.get("noresize").map(String::as_str),
+        Some("1") | Some("true")
+    );
+    match get_or_spawn(&state, socket, &session, follow) {
         Ok(engine) => engine.screen_text().into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn failed: {e}")).into_response(),
     }
