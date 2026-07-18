@@ -82,6 +82,9 @@ pub struct Engine {
     last_input: AtomicU32,
     last_cursor: Mutex<(u16, u16)>,
     closed: AtomicBool,
+    /// Follow-only engines track the tmux window's size (session-owner
+    /// controlled) and ignore client-driven resizes entirely.
+    follow_only: AtomicBool,
 }
 
 impl Engine {
@@ -137,6 +140,7 @@ impl Engine {
             last_input: AtomicU32::new(0),
             last_cursor: Mutex::new((0, 0)),
             closed: AtomicBool::new(false),
+            follow_only: AtomicBool::new(false),
         });
 
         // PTY writer thread: browser input + terminal query replies (DSR etc.)
@@ -203,7 +207,26 @@ impl Engine {
         let _ = self.input_tx.send(data.to_vec());
     }
 
+    pub fn set_follow_only(&self) {
+        self.follow_only.store(true, Ordering::Relaxed);
+    }
+
+    /// Client-driven resize. A no-op on follow-only engines: viewers of a
+    /// session they don't own must not reshape it (server-enforced; the
+    /// `noresize` client behavior is a courtesy, this is the guarantee).
     pub fn resize(&self, cols: u16, rows: u16) {
+        if self.follow_only.load(Ordering::Relaxed) {
+            return;
+        }
+        self.apply_resize(cols, rows);
+    }
+
+    /// Size-follower resize: adopt the tmux window's size into the PTY/term.
+    pub fn follow_resize(&self, cols: u16, rows: u16) {
+        self.apply_resize(cols, rows);
+    }
+
+    fn apply_resize(&self, cols: u16, rows: u16) {
         let cols = cols.clamp(10, 500);
         let rows = rows.clamp(4, 300);
         {

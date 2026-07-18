@@ -68,14 +68,44 @@ fn valid_tmux_socket(path: &str) -> bool {
     p.is_absolute() && p.exists()
 }
 
+/// Current window size of an existing tmux session, if it exists.
+fn session_size(socket: Option<&str>, name: &str) -> Option<(u16, u16)> {
+    let mut cmd = std::process::Command::new("tmux");
+    if let Some(socket) = socket {
+        cmd.arg("-S").arg(socket);
+    }
+    let output = cmd
+        .args(["display-message", "-p", "-t", name, "-F"])
+        .arg("#{window_width} #{window_height}")
+        .env_remove("TMUX")
+        .env_remove("TMUX_TMPDIR")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.split_whitespace();
+    let cols: u16 = parts.next()?.parse().ok()?;
+    let rows: u16 = parts.next()?.parse().ok()?;
+    (cols > 0 && rows > 0).then_some((cols, rows))
+}
+
 /// Get the live engine for a tmux session, lazily attaching (and creating the
 /// session) on first use. A dead engine (tmux client exited) is replaced.
 /// `socket` selects the tmux server (`tmux -S`); `None` uses the
 /// environment-default server.
+///
+/// `follow` puts the engine in session-size-following mode: it adopts the
+/// session's existing size on attach, attaches with the `ignore-size` client
+/// flag so it never shrinks the window, and tracks subsequent window size
+/// changes into its PTY. Used by embedders viewing sessions they don't own
+/// (`noresize=1` connections); standalone viewers keep browser-driven sizing.
 fn get_or_spawn(
     state: &AppState,
     socket: Option<&str>,
     name: &str,
+    follow: bool,
 ) -> anyhow::Result<Arc<Engine>> {
     let key = (socket.map(str::to_string), name.to_string());
     let mut map = state.sessions.lock();
@@ -92,22 +122,67 @@ fn get_or_spawn(
         tmux_args.push("-S".to_string());
         tmux_args.push(socket.to_string());
     }
+    tmux_args.extend(["new-session", "-A"].iter().map(|s| s.to_string()));
+    if follow {
+        // Never influence the window's size; the session's owner controls it.
+        tmux_args.push("-f".to_string());
+        tmux_args.push("ignore-size".to_string());
+    }
     tmux_args.extend(
         [
-            "new-session", "-A", "-s", name,
+            "-s", name,
             // OSC 52 passthrough so tmux copy-mode / in-app copies reach the browser clipboard
             ";", "set-option", "-s", "set-clipboard", "on",
         ]
         .iter()
         .map(|s| s.to_string()),
     );
-    let engine = Engine::spawn(tmux_args, 120, 32)?;
+    let (cols, rows) = if follow {
+        session_size(socket, name).unwrap_or((120, 32))
+    } else {
+        (120, 32)
+    };
+    let engine = Engine::spawn(tmux_args, cols, rows)?;
+    if follow {
+        engine.set_follow_only();
+        spawn_size_follower(
+            engine.clone(),
+            socket.map(str::to_string),
+            name.to_string(),
+        );
+    }
     map.insert(key, engine.clone());
     tracing::info!(
-        "attached engine to tmux session '{name}'{}",
-        socket.map(|s| format!(" (server {s})")).unwrap_or_default()
+        "attached engine to tmux session '{name}'{} ({cols}x{rows}{})",
+        socket.map(|s| format!(" (server {s})")).unwrap_or_default(),
+        if follow { ", following" } else { "" }
     );
     Ok(engine)
+}
+
+/// Track the tmux window's size into the engine PTY while in follow mode, so
+/// the view renders whatever the session's owner sizes it to.
+fn spawn_size_follower(engine: Arc<Engine>, socket: Option<String>, name: String) {
+    tokio::spawn(async move {
+        let mut current = None;
+        while !engine.is_closed() {
+            let size = tokio::task::spawn_blocking({
+                let socket = socket.clone();
+                let name = name.clone();
+                move || session_size(socket.as_deref(), &name)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some((cols, rows)) = size {
+                if current != Some((cols, rows)) {
+                    current = Some((cols, rows));
+                    engine.follow_resize(cols, rows);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
 }
 
 #[tokio::main]
@@ -248,7 +323,7 @@ async fn text_dump(
         Ok(socket) => socket,
         Err(response) => return response,
     };
-    match get_or_spawn(&state, socket, &session) {
+    match get_or_spawn(&state, socket, &session, false) {
         Ok(engine) => engine.screen_text().into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn failed: {e}")).into_response(),
     }
@@ -273,7 +348,15 @@ async fn ws_upgrade(
     // Read-only is a property of the connection, decided by whoever
     // establishes it (an auth layer / relay in front of rmte).
     let read_only = matches!(q.get("ro").map(String::as_str), Some("1") | Some("true"));
-    let engine = match get_or_spawn(&state, socket, &session) {
+    // noresize connections view a session they don't own: the engine adopts
+    // and follows the session's size (server-enforced; the client-side
+    // noresize behavior is a courtesy, the engine's follow-only mode is the
+    // guarantee).
+    let no_resize = matches!(
+        q.get("noresize").map(String::as_str),
+        Some("1") | Some("true")
+    );
+    let engine = match get_or_spawn(&state, socket, &session, no_resize) {
         Ok(engine) => engine,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("spawn failed: {e}"))

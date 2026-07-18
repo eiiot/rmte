@@ -160,9 +160,13 @@ state. With no override the client behaves standalone and appends
 `session`/`ro` from its own query.
 
 `window.RMTE_NO_RESIZE` (or `?noresize=1`) keeps the connection interactive
-(keystrokes and mouse still flow) but suppresses resize messages, so an
-embedder viewing a session it doesn't own won't reshape it to the viewer's
-viewport. This differs from `ro`, which blocks all input.
+(keystrokes and mouse still flow) but suppresses resize messages client-side —
+and `noresize=1` is also honored **server-side**: the engine created by such a
+connection enters *follow* mode. It adopts the session's existing window size
+on attach, attaches with tmux's `ignore-size` client flag so it never shrinks
+the window, tracks the session's size into its PTY (viewers see whatever the
+owner sizes the session to), and ignores `resize` messages from every
+connection. This differs from `ro`, which blocks all input.
 
 ## Versioning
 
