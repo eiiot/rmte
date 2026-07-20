@@ -122,28 +122,12 @@ fn get_or_spawn(
         tmux_args.push("-S".to_string());
         tmux_args.push(socket.to_string());
     }
-    tmux_args.extend(["new-session", "-A"].iter().map(|s| s.to_string()));
-    if follow {
-        // Never influence the window's size; the session's owner controls it.
-        tmux_args.push("-f".to_string());
-        tmux_args.push("ignore-size".to_string());
-    }
-    tmux_args.extend(
-        [
-            "-s", name,
-            // OSC 52 passthrough so tmux copy-mode / in-app copies reach the browser clipboard
-            ";", "set-option", "-s", "set-clipboard", "on",
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
     let (cols, rows) = if follow {
         let size = session_size(socket, name).unwrap_or((120, 32));
         if size.0 < 20 || size.1 < 8 {
             // Faithfully follow it anyway, but leave a trail: a degenerately
-            // small window usually means something else damaged the session
-            // (e.g. a non-ignore-size client shrank it), and the view will
-            // look broken through no fault of the renderer.
+            // small window usually means something else damaged the session,
+            // and the view will look broken through no fault of the renderer.
             tracing::warn!(
                 "session '{name}' has a degenerate window size {}x{}; following as-is",
                 size.0,
@@ -154,6 +138,42 @@ fn get_or_spawn(
     } else {
         (120, 32)
     };
+    tmux_args.extend(["new-session", "-A"].iter().map(|s| s.to_string()));
+    if follow {
+        // Never influence the window's size; the session's owner controls it.
+        tmux_args.push("-f".to_string());
+        tmux_args.push("ignore-size".to_string());
+    }
+    tmux_args.push("-s".to_string());
+    tmux_args.push(name.to_string());
+    if follow {
+        // tmux applies client flags only AFTER its initial size pass on
+        // attach, so ignore-size alone still shrinks the window by the status
+        // line at every attach — repeated sidecar restarts then walk a
+        // session from 50 rows down to the floor. Enforce the follow-mode
+        // contract at the tmux level: window-size manual makes clients unable
+        // to drive the window's size at all, and the chained resize-window
+        // undoes the attach-time shrink by restoring the size we adopted.
+        tmux_args.extend(
+            [
+                ";", "set-option", "-w", "window-size", "manual",
+                ";", "resize-window", "-x",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        tmux_args.push(cols.to_string());
+        tmux_args.push("-y".to_string());
+        tmux_args.push(rows.to_string());
+    }
+    tmux_args.extend(
+        [
+            // OSC 52 passthrough so tmux copy-mode / in-app copies reach the browser clipboard
+            ";", "set-option", "-s", "set-clipboard", "on",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
     let engine = Engine::spawn(tmux_args, cols, rows)?;
     if follow {
         engine.set_follow_only();
