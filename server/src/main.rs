@@ -138,7 +138,19 @@ fn get_or_spawn(
         .map(|s| s.to_string()),
     );
     let (cols, rows) = if follow {
-        session_size(socket, name).unwrap_or((120, 32))
+        let size = session_size(socket, name).unwrap_or((120, 32));
+        if size.0 < 20 || size.1 < 8 {
+            // Faithfully follow it anyway, but leave a trail: a degenerately
+            // small window usually means something else damaged the session
+            // (e.g. a non-ignore-size client shrank it), and the view will
+            // look broken through no fault of the renderer.
+            tracing::warn!(
+                "session '{name}' has a degenerate window size {}x{}; following as-is",
+                size.0,
+                size.1
+            );
+        }
+        size
     } else {
         (120, 32)
     };
