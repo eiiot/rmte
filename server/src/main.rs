@@ -467,6 +467,7 @@ async fn client_loop(socket: WebSocket, engine: Arc<Engine>, session: String, re
                                 engine.resize(cols, rows);
                             }
                             IN_REFRESH => {
+                                tracing::info!(session = %session, "refresh requested; rebroadcasting full frame");
                                 engine.request_full();
                             }
                             IN_PING => {

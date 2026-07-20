@@ -158,6 +158,7 @@ impl Engine {
         std::thread::spawn(move || {
             let mut parser: Processor = Processor::new();
             let mut buf = [0u8; 65536];
+            let mut first_read = true;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -165,6 +166,15 @@ impl Engine {
                         {
                             let mut term = reader_engine.term.lock();
                             parser.advance(&mut *term, &buf[..n]);
+                        }
+                        if first_read {
+                            // Cold-start: a viewer that joined before tmux's
+                            // initial redraw got an *empty* full frame and then
+                            // only incremental damage — rebroadcast a full once
+                            // real content exists so early joiners aren't stuck
+                            // on a black screen.
+                            first_read = false;
+                            reader_engine.request_full();
                         }
                         reader_engine.dirty.notify_one();
                     }
