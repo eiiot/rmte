@@ -166,6 +166,14 @@ those itself; a relay maps its own token to the right session and read-only
 state. With no override the client behaves standalone and appends
 `session`/`ro` from its own query.
 
+`?overwrite=1|0` selects the prediction write model (mosh's
+`predict_overwrite`): overwrite stamps only the typed cell and blanks one cell
+on backspace; shift models canonical line editors by moving the rest of the
+row. Embedded viewers (`noresize`/`ro`) default to overwrite — TUIs repaint
+their input line rather than shifting, so shift-prediction visibly drags ghost
+text (autosuggestions, prompt placeholders) until the echo corrects it.
+Standalone viewers default to shift.
+
 `window.RMTE_NO_RESIZE` (or `?noresize=1`) keeps the connection interactive
 (keystrokes and mouse still flow) but suppresses resize messages client-side —
 and `noresize=1` is also honored **server-side**: the engine created by such a

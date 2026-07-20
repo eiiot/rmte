@@ -106,6 +106,16 @@ const ACK_ECHO_GRACE = 150;
 
 const predict = {
   mode: ['adaptive', 'always', 'never'].includes(params.get('predict')) ? params.get('predict') : 'adaptive',
+  // mosh's predict_overwrite: stamp only the cursor cell on insert and blank
+  // one cell on backspace, instead of shifting the rest of the row. Shifting
+  // models canonical line editors (readline); TUIs repaint their input line
+  // and never shift, so shift-prediction visibly drags ghost text (e.g.
+  // Codex's suggested prompt) around until the echo corrects it. Default:
+  // overwrite for embedded viewers (noresize/read-only — agent TUIs), shift
+  // for standalone shells; ?overwrite=1|0 forces either.
+  overwrite: params.has('overwrite')
+    ? ['1', 'true'].includes(params.get('overwrite'))
+    : (noResize || ['1', 'true'].includes(params.get('ro'))),
   overlays: new Map(),   // rowNum -> array[cols] of conditional overlay cells
   cursors: [],           // {row, col, tue, expirationSeq, ackedAt, predictionTime}
   predictionEpoch: 1,
@@ -318,6 +328,19 @@ function predictInput(str, seq) {
         cur.col -= 1;
         cur.expirationSeq = seq;
         cur.ackedAt = 0;
+        if (predict.overwrite) {
+          // predict_overwrite: blank the vacated cell, shift nothing
+          const cell = row[cur.col];
+          stampCell(cell, seq, now);
+          cell.unknown = false;
+          cell.origCps.push(gridCp(cur.row, cur.col));
+          cell.cp = 32;
+          cell.fg = gridFg(cur.row, cur.col);
+          cell.bg = gridBg(cur.row, cur.col);
+          dirtyRows.add(cur.row);
+          schedulePaint();
+          continue;
+        }
         for (let i = cur.col; i < grid.cols; i++) {
           const cell = row[i];
           stampCell(cell, seq, now);
@@ -361,7 +384,10 @@ function predictInput(str, seq) {
     const row = getOrMakeRow(cur.row);
     if (cur.col + 1 >= grid.cols) becomeTentative(); // last column is tricky
 
-    for (let i = grid.cols - 1; i > cur.col; i--) {
+    // predict_overwrite: rightmost shifted column collapses to the cursor
+    // column, so the loop body never runs and only the typed cell is stamped
+    const rightmost = predict.overwrite ? cur.col : grid.cols - 1;
+    for (let i = rightmost; i > cur.col; i--) {
       const cell = row[i];
       stampCell(cell, seq, now);
       cell.origCps.push(gridCp(cur.row, i));
