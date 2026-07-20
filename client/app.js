@@ -780,6 +780,7 @@ function applyFrame(buf) {
     return;
   }
   if (type === MSG_CLOSED) {
+    setOverlay('ended');
     hud.textContent = 'session ended';
     hud.classList.add('bad');
     return;
@@ -803,6 +804,8 @@ function applyFrame(buf) {
     if (!full) return; // stale partial for old dims
     grid.alloc(cols, rows);
     haveFull = true;
+    reconnectAttempts = 0;
+    setOverlay('hidden');
     grid.modes = modes;
     decodeLines(v, o, lineCount);
     grid.curRow = curRow; grid.curCol = curCol; grid.curVisible = curVisible;
@@ -812,6 +815,8 @@ function applyFrame(buf) {
     return;
   }
   haveFull = true;
+  reconnectAttempts = 0;
+  setOverlay('hidden');
   grid.modes = modes;
 
   const prevCurRow = grid.curRow;
@@ -868,6 +873,71 @@ function wsOverride() {
   return (typeof window !== 'undefined' && window.RMTE_WS_URL) || params.get('ws') || null;
 }
 
+// ---- connection status overlay ----
+// A viewer must never stare at an unexplained black canvas: surface the
+// connection state (connecting / waiting for content / reconnecting / ended)
+// front and center until real frames render.
+const overlay = document.createElement('div');
+overlay.style.cssText =
+  'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;' +
+  'pointer-events:none;z-index:20;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;';
+const overlayPill = document.createElement('div');
+overlayPill.style.cssText =
+  'background:rgba(24,24,24,0.92);color:#9aa0a6;border:1px solid #333;' +
+  'border-radius:8px;padding:10px 18px;';
+overlay.appendChild(overlayPill);
+document.body.appendChild(overlay);
+
+let overlayState = 'connecting'; // connecting | waiting | reconnecting | ended | hidden
+let overlaySince = performance.now();
+let reconnectAttempts = 0;
+
+function setOverlay(state) {
+  if (overlayState !== state) {
+    overlayState = state;
+    overlaySince = performance.now();
+  }
+  renderOverlay();
+}
+
+function renderOverlay() {
+  if (overlayState === 'hidden') {
+    overlay.style.display = 'none';
+    return;
+  }
+  overlay.style.display = 'flex';
+  const secs = Math.floor((performance.now() - overlaySince) / 1000);
+  const attempt = reconnectAttempts > 1 ? ` (attempt ${reconnectAttempts})` : '';
+  overlayPill.textContent =
+    overlayState === 'connecting' ? `connecting…${attempt}` :
+    overlayState === 'waiting' ? `connected — waiting for content${secs >= 2 ? ` (${secs}s)` : '…'}${attempt}` :
+    overlayState === 'reconnecting' ? `reconnecting…${attempt}` :
+    'session ended';
+}
+setInterval(() => { if (overlayState !== 'hidden') renderOverlay(); }, 1000);
+
+// Watchdog: connected but no content within this window means this connection
+// is a dud (e.g. a relay replica that dispatches but never delivers frames) —
+// reconnecting re-rolls the dice and usually lands on a healthy path.
+const FIRST_CONTENT_WATCHDOG_MS = 4000;
+let watchdog = null;
+function armWatchdog() {
+  clearTimeout(watchdog);
+  watchdog = setTimeout(() => {
+    if (connected && !haveFull && ws && ws.readyState === WebSocket.OPEN) {
+      // Hard teardown, not a polite close: a dud server that ignores the
+      // close handshake would keep us in CLOSING for tens of seconds and
+      // stall the reconnect. Abandon the socket and dial fresh.
+      const dud = ws;
+      dud.onopen = dud.onmessage = dud.onclose = dud.onerror = null;
+      try { dud.close(); } catch {}
+      connected = false;
+      setOverlay('reconnecting');
+      setTimeout(connect, 300);
+    }
+  }, FIRST_CONTENT_WATCHDOG_MS);
+}
+
 function connect() {
   const override = wsOverride();
   let url;
@@ -892,6 +962,9 @@ function connect() {
   ws.onopen = () => {
     connected = true;
     haveFull = false;
+    reconnectAttempts += 1;
+    setOverlay('waiting');
+    armWatchdog();
     sendResize();
     updateHud();
   };
@@ -900,6 +973,8 @@ function connect() {
     : (ev) => applyFrame(ev.data);
   ws.onclose = () => {
     connected = false;
+    clearTimeout(watchdog);
+    if (overlayState !== 'ended') setOverlay('reconnecting');
     hud.textContent = 'reconnecting…';
     hud.classList.add('bad');
     setTimeout(connect, 500);
