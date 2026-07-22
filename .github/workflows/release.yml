@@ -1,0 +1,77 @@
+# Release builds for every platform tuft daemons run on.
+#
+# Triggered by pushing a v* tag. Each matrix job builds one target and
+# uploads its asset; the final job downloads everything, writes a single
+# SHA256SUMS, and creates the GitHub release. Asset naming and packaging
+# match what tuft's installer expects (crates: src/rmte.rs in expo/tuft):
+# macOS ships a .tgz whose single member is `rmte`, Linux ships the bare
+# binary.
+
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            asset: rmte-darwin-arm64.tgz
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            asset: rmte-darwin-amd64.tgz
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            asset: rmte-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            asset: rmte-linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p dist
+          case "${{ matrix.asset }}" in
+            *.tgz)
+              cp "target/${{ matrix.target }}/release/rmte" dist/rmte
+              tar -C dist -czf "dist/${{ matrix.asset }}" rmte
+              rm dist/rmte
+              ;;
+            *)
+              cp "target/${{ matrix.target }}/release/rmte" "dist/${{ matrix.asset }}"
+              ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Built by release CI. SHA-256 digests in SHA256SUMS; tuft pins and verifies them at install." \
+            dist/*
