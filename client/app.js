@@ -1032,6 +1032,49 @@ function updateHud() {
 }
 
 // ---- keyboard ----
+// Canvas elements cannot receive text input from a software keyboard. Keep a
+// tiny, transparent textarea focused on coarse-pointer devices so tapping the
+// terminal summons the OS keyboard and its text/composition events can be
+// forwarded to the PTY.
+const mobileInput = document.createElement('textarea');
+mobileInput.setAttribute('aria-label', 'Terminal input');
+mobileInput.setAttribute('autocomplete', 'off');
+mobileInput.setAttribute('autocapitalize', 'none');
+mobileInput.setAttribute('autocorrect', 'off');
+mobileInput.setAttribute('spellcheck', 'false');
+mobileInput.setAttribute('inputmode', 'text');
+mobileInput.setAttribute('enterkeyhint', 'enter');
+mobileInput.style.cssText =
+  'position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;' +
+  'padding:0;border:0;resize:none;z-index:-1;';
+document.body.appendChild(mobileInput);
+
+function focusMobileInput() {
+  if (readOnly) return;
+  try { mobileInput.focus({ preventScroll: true }); }
+  catch { mobileInput.focus(); }
+}
+
+canvas.addEventListener('pointerdown', focusMobileInput);
+
+let composing = false;
+mobileInput.addEventListener('compositionstart', () => { composing = true; });
+mobileInput.addEventListener('compositionend', () => {
+  composing = false;
+});
+mobileInput.addEventListener('input', (e) => {
+  if (composing || e.isComposing) return;
+  const text = e.inputType === 'deleteContentBackward' ? '\x7f' :
+    e.inputType === 'deleteContentForward' ? '\x1b[3~' :
+    (e.inputType === 'insertLineBreak' || e.inputType === 'insertParagraph') ? '\r' :
+    (e.data || mobileInput.value);
+  if (text) {
+    const s = sendInput(text);
+    predictInput(text, s);
+  }
+  mobileInput.value = '';
+});
+
 const CODE_CHARS = {};
 for (let i = 0; i < 26; i++) CODE_CHARS['Key' + String.fromCharCode(65 + i)] = String.fromCharCode(97 + i);
 for (let i = 0; i < 10; i++) CODE_CHARS['Digit' + i] = String(i);
@@ -1119,6 +1162,10 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (e.metaKey) return; // other cmd combos stay with the browser
+  // Printable textarea keystrokes arrive through `input`, which also covers
+  // software keyboards and IMEs. Keep keydown for terminal control keys.
+  if (e.target === mobileInput && e.key.length === 1 &&
+      !e.ctrlKey && !e.altKey) return;
   const seq = encodeKey(e);
   if (seq !== null) {
     e.preventDefault();
