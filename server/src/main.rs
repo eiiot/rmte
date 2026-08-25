@@ -387,6 +387,10 @@ async fn ws_upgrade(
     // Read-only is a property of the connection, decided by whoever
     // establishes it (an auth layer / relay in front of rmte).
     let read_only = matches!(q.get("ro").map(String::as_str), Some("1") | Some("true"));
+    let channel = match WsChannel::parse(q.get("channel").map(String::as_str)) {
+        Ok(channel) => channel,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     // noresize connections view a session they don't own: the engine adopts
     // and follows the session's size (server-enforced; the client-side
     // noresize behavior is a courtesy, the engine's follow-only mode is the
@@ -402,7 +406,7 @@ async fn ws_upgrade(
                 .into_response()
         }
     };
-    ws.on_upgrade(move |socket| client_loop(socket, engine, session, read_only))
+    ws.on_upgrade(move |socket| client_loop(socket, engine, session, read_only, channel))
 }
 
 const IN_INPUT: u8 = 1;
@@ -415,34 +419,115 @@ const IN_REFRESH: u8 = 4;
 
 const PROTOCOL_VERSION: u8 = 1;
 const HELLO_FLAG_READ_ONLY: u8 = 1;
+/// Input acknowledgements arrive as connection-local type-6 messages instead
+/// of being read from the session-wide frame header.
+const HELLO_FLAG_SEPARATE_ACK: u8 = 2;
 
-async fn client_loop(socket: WebSocket, engine: Arc<Engine>, session: String, read_only: bool) {
+/// Output split for authenticated relays that fan one session display stream
+/// out to several independently controlled viewers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WsChannel {
+    /// Existing protocol: hello/control and session-wide display on one socket.
+    Combined,
+    /// Session-wide frame/clipboard/closed events. Input is always disabled.
+    Display,
+    /// Per-viewer hello/input-ack/pong only; session frames stay on Display.
+    Control,
+}
+
+impl WsChannel {
+    fn parse(value: Option<&str>) -> Result<Self, &'static str> {
+        match value {
+            None | Some("") | Some("combined") => Ok(Self::Combined),
+            Some("display") => Ok(Self::Display),
+            Some("control") => Ok(Self::Control),
+            Some(_) => Err("channel must be combined, display, or control"),
+        }
+    }
+
+    fn carries_display(self) -> bool {
+        self != Self::Control
+    }
+
+    fn uses_separate_ack(self) -> bool {
+        self != Self::Combined
+    }
+}
+
+async fn client_loop(
+    socket: WebSocket,
+    engine: Arc<Engine>,
+    session: String,
+    read_only: bool,
+    channel: WsChannel,
+) {
     let (mut tx, mut rx) = socket.split();
     let mut frames = engine.frames.subscribe();
+    let read_only = read_only || channel == WsChannel::Display;
+    let mut pending_ack: Option<(u32, u64)> = None;
 
     // hello: [0][protocol version][flags][utf8 session name]
     let mut hello = BytesMut::with_capacity(3 + session.len());
     hello.put_u8(engine::MSG_HELLO);
     hello.put_u8(PROTOCOL_VERSION);
-    hello.put_u8(if read_only { HELLO_FLAG_READ_ONLY } else { 0 });
+    let mut hello_flags = if read_only { HELLO_FLAG_READ_ONLY } else { 0 };
+    if channel.uses_separate_ack() {
+        hello_flags |= HELLO_FLAG_SEPARATE_ACK;
+    }
+    hello.put_u8(hello_flags);
     hello.put_slice(session.as_bytes());
     if tx.send(Message::Binary(hello.freeze())).await.is_err() {
         return;
     }
 
-    engine.request_full();
+    // A control connection has no display consumer. Relays explicitly send a
+    // refresh after attaching a new viewer so they can deduplicate refreshes
+    // across reconnects; the one display connection requests its own initial
+    // snapshot here.
+    if channel.carries_display() {
+        engine.request_full();
+    }
 
     loop {
         tokio::select! {
-            frame = frames.recv() => {
-                match frame {
-                    Ok(bytes) => {
-                        if tx.send(Message::Binary(bytes)).await.is_err() {
+            event = frames.recv(), if channel.carries_display() || pending_ack.is_some() => {
+                match event {
+                    Ok(event) => {
+                        if channel.carries_display()
+                            && tx.send(Message::Binary(event.bytes.clone())).await.is_err()
+                        {
                             break;
+                        }
+
+                        if channel == WsChannel::Control {
+                            if let (Some(frame_seq), Some((input_seq, input_generation))) =
+                                (event.frame_seq, pending_ack)
+                            {
+                                if event.input_generation >= input_generation {
+                                    // [6][u32 client input seq][u32 shared frame seq]
+                                    let mut ack = BytesMut::with_capacity(9);
+                                    ack.put_u8(engine::MSG_INPUT_ACK);
+                                    ack.put_u32_le(input_seq);
+                                    ack.put_u32_le(frame_seq);
+                                    if tx.send(Message::Binary(ack.freeze())).await.is_err() {
+                                        break;
+                                    }
+                                    pending_ack = None;
+                                }
+                            }
+
+                            // Session closure is carried once by the display
+                            // channel. Stop a control socket that happened to
+                            // be awaiting an ack when the engine closed too.
+                            if event.bytes.first() == Some(&engine::MSG_CLOSED) {
+                                break;
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Client fell behind; resync with a full frame.
+                        // A display client fell behind, or a control client
+                        // missed the frame watermark for a pending ack. One
+                        // fresh full frame repairs either case.
                         frames = frames.resubscribe();
                         engine.request_full();
                     }
@@ -459,7 +544,22 @@ async fn client_loop(socket: WebSocket, engine: Arc<Engine>, session: String, re
                             // [1][u32 input seq][utf8 payload]
                             IN_INPUT if data.len() >= 5 && !read_only => {
                                 let seq = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-                                engine.write_input(seq, &data[5..]);
+                                if channel == WsChannel::Control {
+                                    // Subscribe at the current tail before the
+                                    // input wakes the renderer. Idle control
+                                    // sockets therefore do not wake for every
+                                    // session frame.
+                                    frames = engine.frames.subscribe();
+                                }
+                                if let Some(generation) = engine.write_input(seq, &data[5..]) {
+                                    if channel == WsChannel::Control {
+                                        // A later ack is cumulative, so only
+                                        // the newest unacknowledged input is
+                                        // needed while frames coalesce.
+                                        pending_ack = Some((seq, generation));
+                                        engine.request_input_ack_frame();
+                                    }
+                                }
                             }
                             IN_RESIZE if data.len() >= 5 && !read_only => {
                                 let cols = u16::from_le_bytes([data[1], data[2]]);
@@ -470,7 +570,7 @@ async fn client_loop(socket: WebSocket, engine: Arc<Engine>, session: String, re
                                 tracing::info!(session = %session, "refresh requested; rebroadcasting full frame");
                                 engine.request_full();
                             }
-                            IN_PING => {
+                            IN_PING if channel != WsChannel::Display => {
                                 let mut pong = BytesMut::with_capacity(data.len());
                                 pong.put_u8(engine::MSG_PONG);
                                 pong.put_slice(&data[1..]);
@@ -487,5 +587,19 @@ async fn client_loop(socket: WebSocket, engine: Arc<Engine>, session: String, re
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WsChannel;
+
+    #[test]
+    fn websocket_channel_query_is_explicit_and_backward_compatible() {
+        assert_eq!(WsChannel::parse(None), Ok(WsChannel::Combined));
+        assert_eq!(WsChannel::parse(Some("combined")), Ok(WsChannel::Combined));
+        assert_eq!(WsChannel::parse(Some("display")), Ok(WsChannel::Display));
+        assert_eq!(WsChannel::parse(Some("control")), Ok(WsChannel::Control));
+        assert!(WsChannel::parse(Some("frames")).is_err());
     }
 }
