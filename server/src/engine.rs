@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use alacritty_terminal::event::{Event, EventListener};
@@ -21,6 +21,7 @@ pub const MSG_FRAME: u8 = 1;
 pub const MSG_PONG: u8 = 2;
 pub const MSG_CLOSED: u8 = 4;
 pub const MSG_CLIPBOARD: u8 = 5;
+pub const MSG_INPUT_ACK: u8 = 6;
 
 pub const ATTR_BOLD: u16 = 1;
 pub const ATTR_ITALIC: u16 = 2;
@@ -41,7 +42,29 @@ pub const MODE_MOUSE_DRAG: u32 = 64;
 #[derive(Clone)]
 pub struct EventProxy {
     pty_writes: std::sync::mpsc::Sender<Vec<u8>>,
-    frames: broadcast::Sender<Bytes>,
+    frames: broadcast::Sender<EngineMessage>,
+}
+
+/// One session-wide message plus the render watermark needed to acknowledge
+/// connection-local input on a separate control channel.
+///
+/// The bytes themselves stay shared: the render loop builds one frame and the
+/// broadcast channel clones its reference for every display/control listener.
+#[derive(Clone)]
+pub struct EngineMessage {
+    pub bytes: Bytes,
+    pub frame_seq: Option<u32>,
+    pub input_generation: u64,
+}
+
+impl EngineMessage {
+    fn event(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            frame_seq: None,
+            input_generation: 0,
+        }
+    }
 }
 
 impl EventListener for EventProxy {
@@ -55,7 +78,7 @@ impl EventListener for EventProxy {
                 let mut msg = BytesMut::with_capacity(1 + text.len());
                 msg.put_u8(MSG_CLIPBOARD);
                 msg.put_slice(text.as_bytes());
-                let _ = self.frames.send(msg.freeze());
+                let _ = self.frames.send(EngineMessage::event(msg.freeze()));
             }
             // OSC 52 read: we can't read the browser clipboard; reply empty.
             Event::ClipboardLoad(_, format) => {
@@ -70,7 +93,7 @@ pub struct Engine {
     pub term: Mutex<Term<EventProxy>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     input_tx: std::sync::mpsc::Sender<Vec<u8>>,
-    pub frames: broadcast::Sender<Bytes>,
+    pub frames: broadcast::Sender<EngineMessage>,
     dirty: Notify,
     full_needed: AtomicBool,
     seq: AtomicU32,
@@ -80,6 +103,11 @@ pub struct Engine {
     // exact; concurrent typers at worst cause an early epoch kill, never a
     // wrong display.)
     last_input: AtomicU32,
+    /// Server-local ordering for inputs across all connections. Unlike the
+    /// client-provided sequence, this cannot collide when several viewers each
+    /// start at sequence 1. Frame metadata snapshots it so a control channel
+    /// can tie its viewer's acknowledgement to a specific shared frame.
+    input_generation: AtomicU64,
     last_cursor: Mutex<(u16, u16)>,
     closed: AtomicBool,
     /// Follow-only engines track the tmux window's size (session-owner
@@ -138,6 +166,7 @@ impl Engine {
             full_needed: AtomicBool::new(false),
             seq: AtomicU32::new(0),
             last_input: AtomicU32::new(0),
+            input_generation: AtomicU64::new(0),
             last_cursor: Mutex::new((0, 0)),
             closed: AtomicBool::new(false),
             follow_only: AtomicBool::new(false),
@@ -184,7 +213,9 @@ impl Engine {
             reader_engine.closed.store(true, Ordering::Relaxed);
             let mut msg = BytesMut::with_capacity(1);
             msg.put_u8(MSG_CLOSED);
-            let _ = reader_engine.frames.send(msg.freeze());
+            let _ = reader_engine
+                .frames
+                .send(EngineMessage::event(msg.freeze()));
             tracing::info!("tmux client exited");
         });
 
@@ -212,9 +243,20 @@ impl Engine {
         self.dirty.notify_one();
     }
 
-    pub fn write_input(&self, seq: u32, data: &[u8]) {
+    /// Queue one client's input and return its session-wide generation.
+    pub fn write_input(&self, seq: u32, data: &[u8]) -> Option<u64> {
+        self.input_tx.send(data.to_vec()).ok()?;
         self.last_input.store(seq, Ordering::Relaxed);
-        let _ = self.input_tx.send(data.to_vec());
+        let generation = self.input_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        Some(generation)
+    }
+
+    /// Ensure a split control connection receives a frame watermark for its
+    /// pending acknowledgement even when the application does not echo (for
+    /// example, a password prompt). Legacy combined connections retain their
+    /// existing output-driven render behavior.
+    pub fn request_input_ack_frame(&self) {
+        self.dirty.notify_one();
     }
 
     pub fn set_follow_only(&self) {
@@ -274,7 +316,7 @@ impl Engine {
         out
     }
 
-    fn build_frame(&self, full: bool) -> Bytes {
+    fn build_frame(&self, full: bool) -> EngineMessage {
         let mut term = self.term.lock();
         let cols = term.columns();
         let rows = term.screen_lines();
@@ -442,6 +484,10 @@ impl Engine {
             buf[count_pos + 1] = count_bytes[1];
         }
 
-        buf.freeze()
+        EngineMessage {
+            bytes: buf.freeze(),
+            frame_seq: Some(seq),
+            input_generation: self.input_generation.load(Ordering::Acquire),
+        }
     }
 }

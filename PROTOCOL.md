@@ -18,7 +18,8 @@ either mode — bind it privately and put your auth layer in front.
 ## Connection
 
 ```
-GET /ws[?session=<name>][&ro=1]   (WebSocket upgrade)
+GET /ws[?session=<name>][&ro=1][&channel=<combined|display|control>]
+    (WebSocket upgrade)
 ```
 
 - `session` — tmux session name to attach to (created via `tmux new-session -A`
@@ -39,6 +40,23 @@ GET /ws[?session=<name>][&ro=1]   (WebSocket upgrade)
   attach-or-create: a session name valid on one server silently creates an
   empty session on another, so embedders with multiple servers must pass the
   right socket per session.
+- `channel` — splits session-wide display traffic from connection-local
+  control traffic for relays that want to publish each frame once and fan it
+  out to many viewers:
+  - `combined` (default) preserves the original protocol: hello, frames,
+    clipboard, close, pong, and embedded input acknowledgements all use one
+    connection.
+  - `display` carries the shared frame/clipboard/close stream. It is always
+    read-only, irrespective of `ro`, and one such connection can serve every
+    viewer of the session.
+  - `control` carries one viewer's hello, input acknowledgements, and pongs;
+    it accepts that viewer's input/resize/refresh messages but does not receive
+    frames. A relay pairs every control connection with the session's shared
+    display connection.
+
+  `display` and `control` are an additive relay mode within protocol version 1.
+  A relay must deliver the control hello before forwarding shared frames to a
+  browser so the client knows to use separate acknowledgements.
 
 Multiple simultaneous connections to one session mirror the same screen
 (equivalent to two `tmux attach`es). The most recent `resize` from any
@@ -57,11 +75,14 @@ First byte of every message is the type.
 |---------|------|------------------------------------|
 | type    | u8   | `0`                                |
 | version | u8   | protocol version, currently `1`    |
-| flags   | u8   | bit 0: connection is read-only     |
+| flags   | u8   | bit 0: read-only; bit 1: separate input ACKs |
 | session | utf8 | session name, to end of message    |
 
 Clients should verify `version == 1` and disable input locally when the
-read-only flag is set.
+read-only flag is set. When flag bit 1 is set, clients must ignore the `ack`
+field embedded in shared frames and use type-6 input acknowledgement messages
+instead. The bit is set on both halves of a split relay connection; relays
+normally forward only the control hello to the browser.
 
 ### 1 — frame (screen update)
 
@@ -107,6 +128,11 @@ the PTY before this frame was built. It does *not* guarantee the application
 has echoed it yet — prediction engines should confirm matches at ack but allow
 an echo grace period before judging a prediction wrong.
 
+The embedded `ack` is retained for backward-compatible `combined` connections.
+It is session-wide and therefore unsuitable when several interactive viewers
+use overlapping client sequence numbers. Clients whose hello has the separate
+ACK flag ignore this field.
+
 Attribute bits: `1` bold, `2` italic, `4` underline, `8` dim, `16` strikeout,
 `32` wide char (occupies 2 cells), `64` wide-char spacer (skip glyph, paint bg).
 
@@ -128,6 +154,19 @@ server replaces the dead engine on the next connection to that session.
 `[5][utf8 text]` — an application inside the session set the clipboard via
 OSC 52 (rmte runs tmux with `set-clipboard on`). Clients should write the
 text to the system clipboard if permitted.
+
+### 6 — input acknowledgement
+
+| field       | type | notes                                             |
+|-------------|------|---------------------------------------------------|
+| type        | u8   | `6`                                               |
+| input_seq   | u32  | highest input sequence accepted on this control connection |
+| frame_seq   | u32  | shared frame built after that input reached the PTY queue   |
+
+Sent only on `channel=control`. A relay forwards it on the matching viewer's
+control lane. The client applies `input_seq` once it has applied a shared frame
+whose sequence is at least `frame_seq`; this preserves ack-gated prediction
+even if the relay's display and control paths arrive in either order.
 
 ## Client → server messages
 

@@ -37,6 +37,8 @@ cargo build --release
 - `?session=<name>` — attach to (or create) a specific tmux session; engines
   spawn lazily per session
 - `?ro=1` — read-only connection (input and resize ignored server-side)
+- `?channel=display|control` — split one session-wide display stream from
+  per-viewer input/ack/pong streams for broker-backed fanout relays
 - `?ws=<url>` / `window.RMTE_WS_URL` — point the client at an external
   WebSocket endpoint (for relays/embedders) instead of its own origin
 - `?lag=150` — simulate 150ms of extra RTT to feel the prediction engine work
@@ -61,6 +63,8 @@ node test/e2e.mjs        # keystroke -> frame latency through the full stack
 node test/flood.mjs      # output flood coalescing
 node test/clip.mjs       # OSC 52 clipboard passthrough
 node test/sessions.mjs   # multi-session isolation + read-only enforcement
+node test/channels.mjs   # shared display + isolated per-viewer control lanes
+node test/separate-ack-client.mjs # split ACK ordering in the browser client
 node test/socket-param.mjs    # tmux server selection via ?socket= (two instances)
 node test/unix-socket.mjs     # serving over a 0600 unix socket (needs --listen)
 node test/predict.mjs    # prediction engine semantics under 300ms lag

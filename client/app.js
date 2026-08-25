@@ -1,7 +1,8 @@
 'use strict';
 
 // ---- protocol constants (keep in sync with server/src/engine.rs) ----
-const MSG_HELLO = 0, MSG_FRAME = 1, MSG_PONG = 2, MSG_CLOSED = 4, MSG_CLIPBOARD = 5;
+const MSG_HELLO = 0, MSG_FRAME = 1, MSG_PONG = 2, MSG_CLOSED = 4,
+      MSG_CLIPBOARD = 5, MSG_INPUT_ACK = 6;
 const IN_INPUT = 1, IN_RESIZE = 2, IN_PING = 3;
 const ATTR_BOLD = 1, ATTR_ITALIC = 2, ATTR_UNDERLINE = 4, ATTR_DIM = 8,
       ATTR_STRIKEOUT = 16, ATTR_WIDE = 32, ATTR_SPACER = 64;
@@ -753,6 +754,35 @@ function paintAll() {
 }
 
 // ---- frame decoding ----
+let separateInputAcks = false;
+let separateAckSeq = 0;
+let latestFrameSeq = 0;
+let pendingInputAck = null; // {inputSeq, frameSeq}
+
+function activateInputAck(inputSeq, frameSeq) {
+  if (!separateInputAcks || inputSeq <= separateAckSeq) return;
+  if (latestFrameSeq < frameSeq) {
+    if (!pendingInputAck || inputSeq >= pendingInputAck.inputSeq) {
+      pendingInputAck = { inputSeq, frameSeq };
+    }
+    return;
+  }
+  separateAckSeq = inputSeq;
+  if (pendingInputAck && pendingInputAck.inputSeq <= inputSeq) pendingInputAck = null;
+  // The matching display frame may have arrived before this control message.
+  // Reconcile now against that already-applied server state.
+  reconcilePredictions(separateAckSeq, false);
+}
+
+function ackForAppliedFrame(frameSeq, embeddedAck) {
+  latestFrameSeq = frameSeq;
+  if (separateInputAcks && pendingInputAck && frameSeq >= pendingInputAck.frameSeq) {
+    separateAckSeq = Math.max(separateAckSeq, pendingInputAck.inputSeq);
+    pendingInputAck = null;
+  }
+  return separateInputAcks ? separateAckSeq : embeddedAck;
+}
+
 function applyFrame(buf) {
   const v = new DataView(buf);
   let o = 0;
@@ -761,6 +791,10 @@ function applyFrame(buf) {
     // [version][flags][utf8 session name]
     const flags = v.getUint8(2);
     readOnly = !!(flags & 1);
+    separateInputAcks = !!(flags & 2);
+    separateAckSeq = 0;
+    latestFrameSeq = 0;
+    pendingInputAck = null;
     if (readOnly) predict.mode = 'never';
     sessionName = new TextDecoder().decode(new Uint8Array(buf, 3));
     document.title = `${sessionName}${readOnly ? ' (read-only)' : ''} — rmte`;
@@ -779,6 +813,10 @@ function applyFrame(buf) {
     if (text) navigator.clipboard.writeText(text).catch(() => {});
     return;
   }
+  if (type === MSG_INPUT_ACK && v.byteLength >= 9) {
+    activateInputAck(v.getUint32(1, true), v.getUint32(5, true));
+    return;
+  }
   if (type === MSG_CLOSED) {
     setOverlay('ended');
     hud.textContent = 'session ended';
@@ -788,14 +826,14 @@ function applyFrame(buf) {
   if (type !== MSG_FRAME) return;
 
   const flags = v.getUint8(o); o += 1;
-  o += 4; // seq
+  const frameSeq = v.getUint32(o, true); o += 4;
   const cols = v.getUint16(o, true); o += 2;
   const rows = v.getUint16(o, true); o += 2;
   const curRow = v.getUint16(o, true); o += 2;
   const curCol = v.getUint16(o, true); o += 2;
   const curVisible = !!v.getUint8(o); o += 1;
   const modes = v.getUint32(o, true); o += 4;
-  const ack = v.getUint32(o, true); o += 4;
+  const embeddedAck = v.getUint32(o, true); o += 4;
   const lineCount = v.getUint16(o, true); o += 2;
 
   const full = !!(flags & 1);
@@ -809,6 +847,7 @@ function applyFrame(buf) {
     grid.modes = modes;
     decodeLines(v, o, lineCount);
     grid.curRow = curRow; grid.curCol = curCol; grid.curVisible = curVisible;
+    ackForAppliedFrame(frameSeq, embeddedAck);
     fitToViewport(); // dims changed: refit non-driving viewers before painting
     paintAll();
     updateHud();
@@ -828,6 +867,7 @@ function applyFrame(buf) {
   // a clear/alt-screen switch may arrive as all-rows partial damage rather
   // than a flagged full frame — treat a near-total redraw the same way
   const redraw = full || lineCount >= Math.max(4, Math.floor(grid.rows * 0.8));
+  const ack = ackForAppliedFrame(frameSeq, embeddedAck);
   reconcilePredictions(ack, redraw);
   schedulePaint();
 }
